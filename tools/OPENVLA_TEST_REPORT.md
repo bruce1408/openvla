@@ -328,7 +328,7 @@ Profiler 同时确认 `sdpa` 路径实际触发了 PyTorch Flash-SDPA kernel，�
 
 ```bash
 /home/bruce/miniconda3/envs/openvla5090/bin/python -u \
-  /share_data/bruce/workspace/openvla_runtime/tools/benchmark_openvla_thor.py \
+  /workspace/openvla/tools/benchmark_openvla_thor.py \
   --warmup 10 \
   --iters 100
 ```
@@ -337,8 +337,8 @@ Profiler 同时确认 `sdpa` 路径实际触发了 PyTorch Flash-SDPA kernel，�
 
 ```bash
 /home/bruce/miniconda3/envs/openvla5090/bin/python -u \
-  /share_data/bruce/workspace/openvla_runtime/tools/infer_batch.py \
-  --image-dir /share_data/bruce/workspace/openvla_runtime/test_data \
+  /workspace/openvla/tools/infer_batch.py \
+  --image-dir /workspace/openvla/test_data \
   --glob '*.jpg' \
   --instruction 'pick up the object' \
   --limit 100
@@ -348,8 +348,8 @@ Profiler 同时确认 `sdpa` 路径实际触发了 PyTorch Flash-SDPA kernel，�
 
 ```bash
 /home/bruce/miniconda3/envs/openvla5090/bin/python -u \
-  /share_data/bruce/workspace/openvla_runtime/tools/eval_latency.py \
-  --image-dir /share_data/bruce/workspace/openvla_runtime/test_data \
+  /workspace/openvla/tools/eval_latency.py \
+  --image-dir /workspace/openvla/test_data \
   --glob '*.jpg' \
   --instruction 'pick up the object' \
   --limit 100 \
@@ -360,8 +360,8 @@ Profiler 同时确认 `sdpa` 路径实际触发了 PyTorch Flash-SDPA kernel，�
 
 ```bash
 /home/bruce/miniconda3/envs/openvla5090/bin/python -u \
-  /share_data/bruce/workspace/openvla_runtime/tools/eval_operators.py \
-  --image /share_data/bruce/workspace/openvla_runtime/test_data/bridge_sample_0001.jpg \
+  /workspace/openvla/tools/eval_operators.py \
+  --image /workspace/openvla/test_data/bridge_sample_0001.jpg \
   --instruction 'pick up the object'
 ```
 

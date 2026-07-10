@@ -2,8 +2,9 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
-from runtime_env import ENV_SCRIPT, MODEL_PATH
+RUNTIME_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(RUNTIME_DIR))
+from runtime_env import ENV_SCRIPT, MODEL_PATH, MODEL_REVISION
 
 import torch
 from PIL import Image
@@ -34,11 +35,13 @@ print("model path:", MODEL_PATH)
 
 processor = AutoProcessor.from_pretrained(
     MODEL_PATH,
+    revision=MODEL_REVISION,
     trust_remote_code=True,
     local_files_only=True,
 )
 model = AutoModelForVision2Seq.from_pretrained(
     MODEL_PATH,
+    revision=MODEL_REVISION,
     attn_implementation=ATTN_IMPLEMENTATION,
     torch_dtype=model_dtype(),
     low_cpu_mem_usage=True,

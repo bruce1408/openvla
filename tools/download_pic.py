@@ -3,7 +3,7 @@ import urllib.request
 from pathlib import Path
 
 IMAGE_COUNT = 100
-OUTPUT_DIR = Path("/share_data/bruce/workspace/openvla_runtime/test_data")
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "test_data"
 
 api = (
     "https://datasets-server.huggingface.co/rows"

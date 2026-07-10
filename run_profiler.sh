@@ -3,11 +3,11 @@ set -euo pipefail
 
 # 以脚本自身所在目录为基准,避免依赖调用时的工作目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUNTIME_DIR="$SCRIPT_DIR/openvla_runtime"
+RUNTIME_DIR="$SCRIPT_DIR"
 
-cd "$RUNTIME_DIR"
+cd "$SCRIPT_DIR"
 
-# 让日志输出到脚本旁边的 openvla/openvla_runtime/logs,而非其他 OPENVLA_PREFIX
+# 让日志输出到脚本旁边的 openvla/logs,而非其他 OPENVLA_PREFIX
 export OPENVLA_PREFIX="$RUNTIME_DIR"
 
 # 轻量 profile:trace 体积小,方便用 Perfetto 网页打开(定位瓶颈 2 步足够)

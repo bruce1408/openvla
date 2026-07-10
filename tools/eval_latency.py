@@ -25,8 +25,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
-from runtime_env import MODEL_PATH
+RUNTIME_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(RUNTIME_DIR))
+from runtime_env import MODEL_PATH, MODEL_REVISION
 
 import torch
 from PIL import Image
@@ -38,7 +39,7 @@ DEVICE = os.getenv("OPENVLA_DEVICE", "cuda:0" if torch.cuda.is_available() else 
 ATTN_IMPLEMENTATION = os.getenv("OPENVLA_ATTN_IMPLEMENTATION", "sdpa")
 UNNORM_KEY = os.getenv("OPENVLA_UNNORM_KEY", "bridge_orig")
 
-DEFAULT_IMAGE_DIR = Path(__file__).resolve().parents[1] / "test_data"
+DEFAULT_IMAGE_DIR = RUNTIME_DIR / "test_data"
 
 # 用于在各阶段打点的全局计时表 (由 hook 填充)
 _STAGE_TIMES: dict[str, float] = {}
@@ -199,7 +200,7 @@ def main() -> None:
     if not images:
         raise SystemExit(f"No images matched {image_dir}/{args.glob}")
 
-    output_dir = Path(os.getenv("OPENVLA_PREFIX", str(Path(__file__).resolve().parents[1]))) / "logs"
+    output_dir = Path(os.getenv("OPENVLA_PREFIX", str(RUNTIME_DIR))) / "logs"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = Path(args.output) if args.output else output_dir / f"latency_breakdown_{int(time.time())}.jsonl"
     summary_path = output_path.with_suffix(".summary.json")
@@ -214,9 +215,10 @@ def main() -> None:
         print("gpu:", torch.cuda.get_device_name(0))
         torch.cuda.reset_peak_memory_stats()
 
-    processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
+    processor = AutoProcessor.from_pretrained(MODEL_PATH, revision=MODEL_REVISION, trust_remote_code=True, local_files_only=True)
     model = AutoModelForVision2Seq.from_pretrained(
         MODEL_PATH,
+        revision=MODEL_REVISION,
         attn_implementation=ATTN_IMPLEMENTATION,
         torch_dtype=model_dtype(),
         low_cpu_mem_usage=True,

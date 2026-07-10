@@ -5,8 +5,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
-from runtime_env import MODEL_PATH
+RUNTIME_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(RUNTIME_DIR))
+from runtime_env import MODEL_PATH, MODEL_REVISION
 
 import torch
 from PIL import Image
@@ -78,7 +79,7 @@ def main() -> None:
         description="Profile OpenVLA inference with torch.profiler "
         "(Chrome trace + operator table + flamegraph stacks)."
     )
-    parser.add_argument("--image", default="/share_data/bruce/workspace/openvla/openvla_runtime/test_data/bridge_sample_0001.jpg", help="Path to an input image (default: gray 224x224).")
+    parser.add_argument("--image", default="/workspace/openvla/test_data/bridge_sample_0001.jpg", help="Path to an input image (default: gray 224x224).")
     parser.add_argument("--instruction", default="move the robot arm forward")
     parser.add_argument("--wait", type=int, default=1, help="Profiler schedule: idle steps before warmup.")
     parser.add_argument("--warmup", type=int, default=3, help="Profiler schedule: warmup steps (not recorded).")
@@ -99,7 +100,7 @@ def main() -> None:
 
     # Default to the logs dir next to this script's runtime root, independent of
     # any global OPENVLA_PREFIX. Override with --output-dir when needed.
-    default_dir = Path(__file__).resolve().parents[1] / "logs"
+    default_dir = RUNTIME_DIR / "logs"
     output_dir = Path(args.output_dir) if args.output_dir else default_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -127,11 +128,13 @@ def main() -> None:
     image = load_image(args.image)
     processor = AutoProcessor.from_pretrained(
         MODEL_PATH,
+        revision=MODEL_REVISION,
         trust_remote_code=True,
         local_files_only=True,
     )
     model = AutoModelForVision2Seq.from_pretrained(
         MODEL_PATH,
+        revision=MODEL_REVISION,
         attn_implementation=ATTN_IMPLEMENTATION,
         torch_dtype=dtype(),
         low_cpu_mem_usage=True,
