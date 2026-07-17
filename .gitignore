@@ -161,3 +161,4 @@ hf_cache/
 
 *.jsonl
 *.txt
+deploy/tensorrt/artifacts/
