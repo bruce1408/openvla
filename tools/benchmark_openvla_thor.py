@@ -352,7 +352,9 @@ def timed_generate_tokens(
     # 在 LLM 性能分析里，它通常近似 prefill 阶段开销。
     ttft_ms = (streamer.first_token_time - start) * 1000.0
     decode_total_ms = total_ms - ttft_ms
-    token_count = max(streamer.token_count, 1)
+    # TTFT already includes the first generated token. Only subsequent tokens
+    # belong in the average decode-token denominator.
+    decode_token_count = max(streamer.token_count - 1, 1)
 
     return {
         # generate() 整体耗时。
@@ -365,7 +367,8 @@ def timed_generate_tokens(
         # streamer 捕获的新 token 数。
         "generate_token_count": streamer.token_count,
         # decode 阶段平均每 token 耗时。
-        "generate_time_per_decode_token_ms": decode_total_ms / token_count,
+        "generate_decode_token_count": max(streamer.token_count - 1, 0),
+        "generate_time_per_decode_token_ms": decode_total_ms / decode_token_count,
     }
 
 
@@ -401,8 +404,8 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=64,
-        help="只在 --measure-generate 时使用，控制 generate() 最多生成多少 token。",
+        default=None,
+        help="只在 --measure-generate 时使用；默认取 model.get_action_dim(unnorm_key)。",
     )
     parser.add_argument(
         "--measure-generate",
@@ -463,6 +466,7 @@ def main() -> None:
 
     # 切换到 eval 模式，关闭 dropout 等训练行为。
     model.eval()
+    generate_tokens = args.max_new_tokens or int(model.get_action_dim(UNNORM_KEY))
 
     # Warmup 阶段。
     # 第一次运行通常包含 CUDA kernel 初始化、内存分配、算子 cache 等冷启动开销。
@@ -501,7 +505,7 @@ def main() -> None:
                             processor,
                             image,
                             args.instruction,
-                            args.max_new_tokens,
+                            generate_tokens,
                         )
                     )
                 except Exception as exc:

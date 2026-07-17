@@ -1,0 +1,1506 @@
+diff --git a/.gitignore b/.gitignore
+index ac96fbc..7981e79 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -152,6 +152,9 @@ data/
+ rollouts/
+ wandb/
+ 
++# Generated TensorRT deployment artifacts (large and machine-specific)
++deploy/tensorrt/artifacts/
++
+ 
+ *.json
+ 
+@@ -160,4 +163,7 @@ wandb/
+ hf_cache/
+ 
+ *.jsonl
+-*.txt
+\ No newline at end of file
++*.txt
++!deploy/tensorrt/runtime/cpp/CMakeLists.txt
++!deploy/tensorrt/build/
++!deploy/tensorrt/build/build_vision_engine.sh
+diff --git a/deploy/__init__.py b/deploy/__init__.py
+new file mode 100644
+index 0000000..e30538a
+--- /dev/null
++++ b/deploy/__init__.py
+@@ -0,0 +1 @@
++"""Deployment helpers for OpenVLA."""
+diff --git a/deploy/tensorrt/README.md b/deploy/tensorrt/README.md
+new file mode 100644
+index 0000000..bebb149
+--- /dev/null
++++ b/deploy/tensorrt/README.md
+@@ -0,0 +1,281 @@
++# OpenVLA on Jetson AGX Thor: staged TensorRT deployment
++
++This directory turns the deployment proposal into explicit correctness gates. It intentionally keeps
++`prismatic/extern/hf/modeling_prismatic.py` unchanged as the PyTorch oracle.
++
++## Review outcome
++
++The high-level split is sound:
++
++1. GPU-native preprocessing.
++2. TensorRT for DINOv2 + SigLIP + Prismatic projector.
++3. A KV-cache-aware LLM runtime.
++4. A small deterministic action detokenizer.
++
++Three constraints must be treated as gates, not assumptions:
++
++- TensorRT Edge-LLM's current public matrix explicitly lists Llama 3.x, not Llama 2. The extracted OpenVLA
++  Llama 2 checkpoint must first pass an exporter/build probe. A custom model registration may be required.
++- A 256-row action-only LM head is equivalent only when decoding is constrained to OpenVLA's action-token
++  interval and the reference model also selects a token in that interval. The golden dump records this fact.
++- `n_action_bins=256` produces 256 action token symbols but only 255 bin centers in the current OpenVLA code.
++  Do not generate the C++ lookup table from an assumed length.
++
++## Produced code
++
++```text
++deploy/tensorrt/
++├── common.py
++├── export/
++│   ├── 00_dump_golden.py
++│   ├── 01_export_vision_projector_onnx.py
++│   ├── 02_extract_llama_checkpoint.py
++│   └── 03_export_action_meta.py
++├── build/build_vision_engine.sh
++├── runtime/
++│   ├── trt_runner.py
++│   ├── hybrid_runtime.py
++│   └── cpp/action_decoder.{h,cpp}
++├── validate/validate_vision_engine.py
++└── tests/test_common.py
++```
++
++Generated models and logs live below `deploy/tensorrt/artifacts/` and are ignored by git.
++
++## 0. Freeze the environment
++
++Run on Thor from the repository root. Keep the JetPack-provided CUDA and TensorRT packages together.
++
++```bash
++source env.sh
++
++cat /etc/nv_tegra_release
++nvcc --version
++trtexec --version || /usr/src/tensorrt/bin/trtexec --version
++
++python - <<'PY'
++import torch
++import tensorrt as trt
++print("torch", torch.__version__)
++print("torch CUDA", torch.version.cuda)
++print("TensorRT", trt.__version__)
++print("GPU", torch.cuda.get_device_name(0))
++print("capability", torch.cuda.get_device_capability(0))
++PY
++```
++
++Record the power mode separately. Use the mode approved for the robot's thermal and power envelope; do not
++compare benchmark runs made under different modes.
++
++## 1. PyTorch baseline
++
++The formal end-to-end number comes from `benchmark_openvla_thor.py`. The hook-heavy `eval_latency.py` is for
++diagnosis because its synchronizations perturb natural asynchronous execution.
++
++```bash
++python tools/benchmark_openvla_thor.py \
++  --image test_data/bridge_sample_0001.jpg \
++  --instruction "pick up the blue object" \
++  --warmup 10 \
++  --iters 100 \
++  --measure-generate
++
++python tools/eval_latency.py \
++  --image-dir test_data \
++  --glob '*.jpg' \
++  --limit 20 \
++  --warmup 5
++```
++
++`--max-new-tokens` now defaults to `model.get_action_dim(OPENVLA_UNNORM_KEY)`. The per-decode-token metric also
++excludes the first token, which is produced by prefill.
++
++## 2. Gate 1: dump the golden tensors
++
++```bash
++python deploy/tensorrt/export/00_dump_golden.py \
++  --image test_data/bridge_sample_0001.jpg \
++  --instruction "pick up the blue object" \
++  --unnorm-key bridge_orig \
++  --dtype bf16
++```
++
++Inspect `deploy/tensorrt/artifacts/golden/sample_0001/metadata.json` before proceeding. For the standard model,
++verify:
++
++- `pixel_values` is `[1, 6, 224, 224]`;
++- projected embeddings are `[1, 256, 4096]`;
++- `empty_token_appended` is normally `false` for the standard prompt;
++- `tokens_in_action_range` is `true`;
++- the action dimension matches the selected normalization statistics.
++
++Repeat the dump on a representative fixed validation set, not only one image, before quantization.
++
++## 3. Export the fixed-shape vision graph
++
++Export FP16 first:
++
++```bash
++python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
++  --mode combined \
++  --opset 17
++```
++
++If export fails, isolate the failing branch:
++
++```bash
++python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
++  --mode split \
++  --opset 17
++```
++
++Split mode writes separate DINOv2, SigLIP, and projector graphs under
++`deploy/tensorrt/artifacts/onnx/split/`. This is especially useful because this branch monkey-patches TIMM
++`forward()` with `get_intermediate_layers(..., n={second_to_last_layer})`.
++
++Optional ONNX structural check:
++
++```bash
++python - <<'PY'
++import onnx
++p = 'deploy/tensorrt/artifacts/onnx/vision_projector_fp16.onnx'
++m = onnx.load(p, load_external_data=True)
++onnx.checker.check_model(m)
++print('ONNX check passed')
++PY
++```
++
++## 4. Build the vision engine on Thor
++
++TensorRT plans are hardware/software-specific. Build the plan on the target Thor image rather than copying a
++plan built on a different GPU or TensorRT release.
++
++```bash
++bash deploy/tensorrt/build/build_vision_engine.sh
++```
++
++The default command fixes the only supported input to `1x6x224x224`, enables FP16, and writes:
++
++```text
++deploy/tensorrt/artifacts/engines/vision_projector_fp16.plan
++```
++
++## 5. Gate 2: validate projected embeddings
++
++```bash
++python deploy/tensorrt/validate/validate_vision_engine.py \
++  --engine deploy/tensorrt/artifacts/engines/vision_projector_fp16.plan \
++  --golden-dir deploy/tensorrt/artifacts/golden/sample_0001 \
++  --min-cosine 0.999
++```
++
++Cosine similarity is only an intermediate gate. Record mean/max absolute error as well, then continue to the
++token gate.
++
++## 6. Gates 3-5: hybrid runtime and exact token comparison
++
++```bash
++python deploy/tensorrt/runtime/hybrid_runtime.py \
++  --engine deploy/tensorrt/artifacts/engines/vision_projector_fp16.plan \
++  --image test_data/bridge_sample_0001.jpg \
++  --instruction "pick up the blue object" \
++  --unnorm-key bridge_orig \
++  --llm-dtype bf16 \
++  --compare-reference
++```
++
++This path does not call Hugging Face `generate()` for its candidate result. It explicitly performs:
++
++```text
++TRT projected embeddings
++  -> BOS + 256 vision embeddings + remaining text embeddings
++  -> PyTorch Llama prefill (first action token)
++  -> KV-cache decode (remaining action tokens)
++  -> deterministic q01/q99 unnormalization
++```
++
++Required FP16 acceptance criteria on the full validation set:
++
++1. `tokens_in_action_range == true` for both paths.
++2. First action token exact match.
++3. All action token IDs exact match (target: 100%).
++4. Continuous action max error recorded; exact token match should make detokenization identical.
++5. No rollout-success regression on the real robot before replacing the reference runtime.
++
++When token 1 differs, inspect preprocessing, vision/projector error, BOS insertion, attention mask, and prefill.
++When token 1 matches and a later token differs, inspect the cache length, position offset, and decode input token.
++
++## 7. Export the action sidecar
++
++```bash
++python deploy/tensorrt/export/03_export_action_meta.py \
++  --unnorm-key bridge_orig
++```
++
++The JSON is the source of truth for a later FP32 C++ detokenizer. Do not hard-code `32000`, 256 bin centers, or
++the action dimension in C++.
++
++The C++17 decoder can be tested independently:
++
++```bash
++cmake -S deploy/tensorrt/runtime/cpp \
++  -B deploy/tensorrt/runtime/cpp/build
++cmake --build deploy/tensorrt/runtime/cpp/build -j
++ctest --test-dir deploy/tensorrt/runtime/cpp/build --output-on-failure
++```
++
++## 8. Edge-LLM compatibility probe
++
++Pin an Edge-LLM release/commit and keep its ONNX, builder, and runtime from that same revision. The current
++public workflow is checkpoint -> `tensorrt-edgellm-export` -> `llm_build` -> C++ runtime.
++
++Extract the fine-tuned language model, not base Llama 2:
++
++```bash
++python deploy/tensorrt/export/02_extract_llama_checkpoint.py \
++  --device cpu
++```
++
++On the machine where TensorRT Edge-LLM's exporter is installed:
++
++```bash
++tensorrt-edgellm-export \
++  deploy/tensorrt/artifacts/hf_llama \
++  deploy/tensorrt/artifacts/edgellm_onnx
++```
++
++Treat this as a probe. If the default `CausalLM` cannot load/export the Llama 2 checkpoint, add a registered
++model implementation and checkpoint mapping in Edge-LLM; do not silently substitute Llama 3 or base Llama 2.
++
++After a successful export, build on Thor:
++
++```bash
++/path/to/TensorRT-Edge-LLM/build/examples/llm/llm_build \
++  --onnxDir deploy/tensorrt/artifacts/edgellm_onnx/llm \
++  --engineDir deploy/tensorrt/artifacts/engines/openvla_llama \
++  --maxBatchSize 1 \
++  --maxInputLen 512 \
++  --maxKVCacheCapacity 512
++```
++
++`512` is sufficient only after measuring the actual text length plus 256 visual tokens and generation length.
++Use `1024` while bringing the system up if there is any uncertainty.
++
++The final Edge-LLM integration contract is not ordinary chat input. It must accept externally generated visual
++embeddings at exactly the same sequence position as the hybrid runtime. Stabilize that contract before writing
++the C++ multimodal adapter.
++
++## 9. Optimization order
++
++Apply one change per validation run:
++
++1. Fixed-shape FP16 vision + BF16/FP16 LLM.
++2. Manual prefill/decode and CUDA Graphs.
++3. GPU camera preprocessing and device-resident buffers.
++4. LLM FP8, followed by full token/rollout validation.
++5. Vision FP8, followed by the same validation.
++6. Action-only LM head only after proving constrained decode equivalence.
++7. NVFP4 last; token agreement and rollout success are the release gate, not cosine similarity alone.
++
++For production control, remove PIL, NumPy image copies, JSON transport, and Python from the camera-to-action
++hot path only after the staged runtime is correct.
+diff --git a/deploy/tensorrt/__init__.py b/deploy/tensorrt/__init__.py
+new file mode 100644
+index 0000000..6d94b90
+--- /dev/null
++++ b/deploy/tensorrt/__init__.py
+@@ -0,0 +1 @@
++"""TensorRT deployment utilities for OpenVLA."""
+diff --git a/deploy/tensorrt/build/build_vision_engine.sh b/deploy/tensorrt/build/build_vision_engine.sh
+new file mode 100755
+index 0000000..8fcc880
+--- /dev/null
++++ b/deploy/tensorrt/build/build_vision_engine.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
++onnx_path="${1:-${repo_root}/deploy/tensorrt/artifacts/onnx/vision_projector_fp16.onnx}"
++engine_path="${2:-${repo_root}/deploy/tensorrt/artifacts/engines/vision_projector_fp16.plan}"
++
++if command -v trtexec >/dev/null 2>&1; then
++    trtexec_bin="$(command -v trtexec)"
++elif [[ -x /usr/src/tensorrt/bin/trtexec ]]; then
++    trtexec_bin=/usr/src/tensorrt/bin/trtexec
++else
++    echo "trtexec was not found in PATH or /usr/src/tensorrt/bin" >&2
++    exit 1
++fi
++
++mkdir -p "$(dirname "${engine_path}")"
++"${trtexec_bin}" \
++    --onnx="${onnx_path}" \
++    --saveEngine="${engine_path}" \
++    --fp16 \
++    --shapes=pixel_values:1x6x224x224 \
++    --builderOptimizationLevel=5 \
++    --profilingVerbosity=detailed \
++    --skipInference
++
++echo "Built ${engine_path}"
+diff --git a/deploy/tensorrt/common.py b/deploy/tensorrt/common.py
+new file mode 100644
+index 0000000..33b334a
+--- /dev/null
++++ b/deploy/tensorrt/common.py
+@@ -0,0 +1,166 @@
++"""Shared helpers for the staged OpenVLA TensorRT deployment workflow."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++from transformers import AutoModelForVision2Seq, AutoProcessor
++
++from runtime_env import MODEL_PATH, MODEL_REVISION
++
++
++EMPTY_TOKEN_ID = 29871
++DEFAULT_INSTRUCTION = "pick up the blue object"
++DEFAULT_UNNORM_KEY = "bridge_orig"
++
++
++def prompt_for(instruction: str) -> str:
++    return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
++
++
++def torch_dtype(name: str) -> torch.dtype:
++    mapping = {
++        "bf16": torch.bfloat16,
++        "fp16": torch.float16,
++        "fp32": torch.float32,
++    }
++    try:
++        return mapping[name]
++    except KeyError as exc:
++        raise ValueError(f"Unsupported dtype {name!r}; choose from {sorted(mapping)}") from exc
++
++
++def load_openvla(device: str, dtype_name: str = "bf16") -> tuple[Any, Any]:
++    """Load the pinned OpenVLA processor and model used by this branch."""
++
++    dtype = torch_dtype(dtype_name)
++    processor = AutoProcessor.from_pretrained(
++        MODEL_PATH,
++        revision=MODEL_REVISION,
++        trust_remote_code=True,
++        local_files_only=True,
++    )
++    model = AutoModelForVision2Seq.from_pretrained(
++        MODEL_PATH,
++        revision=MODEL_REVISION,
++        attn_implementation="sdpa",
++        torch_dtype=dtype,
++        low_cpu_mem_usage=True,
++        trust_remote_code=True,
++        local_files_only=True,
++    ).to(device)
++    model.eval()
++    return processor, model
++
++
++def move_batch_to_device(batch: Any, device: str, dtype: torch.dtype) -> Any:
++    """Move a BatchFeature without converting integer token tensors."""
++
++    for key, value in list(batch.items()):
++        if not isinstance(value, torch.Tensor):
++            continue
++        if value.is_floating_point():
++            batch[key] = value.to(device=device, dtype=dtype)
++        else:
++            batch[key] = value.to(device=device)
++    return batch
++
++
++def prepare_action_prompt(
++    input_ids: torch.Tensor,
++    attention_mask: torch.Tensor | None,
++) -> tuple[torch.Tensor, torch.Tensor | None, bool]:
++    """Apply OpenVLA's empty-token rule and keep the attention mask aligned.
++
++    The stock ``predict_action`` only appends token 29871. The standard OpenVLA
++    prompt already ends in that token, so no append normally happens. For custom
++    tokenizers/prompts, extending the mask here prevents a malformed prefill.
++    The returned boolean is persisted in golden metadata for auditability.
++    """
++
++    if torch.all(input_ids[:, -1] == EMPTY_TOKEN_ID):
++        return input_ids, attention_mask, False
++
++    empty = torch.full(
++        (input_ids.shape[0], 1),
++        EMPTY_TOKEN_ID,
++        dtype=input_ids.dtype,
++        device=input_ids.device,
++    )
++    input_ids = torch.cat([input_ids, empty], dim=1)
++    if attention_mask is not None:
++        attention_mask = torch.cat(
++            [attention_mask, torch.ones_like(attention_mask[:, :1])],
++            dim=1,
++        )
++    return input_ids, attention_mask, True
++
++
++def build_multimodal_inputs(
++    model: Any,
++    input_ids: torch.Tensor,
++    attention_mask: torch.Tensor | None,
++    projected_patch_embeddings: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """Reproduce ``modeling_prismatic.py``: BOS + vision + remaining text."""
++
++    text_embeddings = model.get_input_embeddings()(input_ids)
++    projected_patch_embeddings = projected_patch_embeddings.to(text_embeddings.dtype)
++    multimodal_embeddings = torch.cat(
++        [
++            text_embeddings[:, :1, :],
++            projected_patch_embeddings,
++            text_embeddings[:, 1:, :],
++        ],
++        dim=1,
++    )
++
++    multimodal_attention_mask = None
++    if attention_mask is not None:
++        visual_mask = torch.ones(
++            projected_patch_embeddings.shape[:2],
++            dtype=attention_mask.dtype,
++            device=attention_mask.device,
++        )
++        multimodal_attention_mask = torch.cat(
++            [attention_mask[:, :1], visual_mask, attention_mask[:, 1:]],
++            dim=1,
++        )
++    return multimodal_embeddings, multimodal_attention_mask
++
++
++def action_token_bounds(model: Any) -> tuple[int, int]:
++    """Return the inclusive token range used by the 256 action symbols."""
++
++    effective_vocab_size = int(model.vocab_size)
++    n_action_tokens = int(model.config.n_action_bins)
++    return effective_vocab_size - n_action_tokens, effective_vocab_size - 1
++
++
++def decode_action_tokens(model: Any, token_ids: np.ndarray, unnorm_key: str) -> np.ndarray:
++    """Decode action token IDs exactly like ``OpenVLAForActionPrediction``."""
++
++    token_ids = np.asarray(token_ids, dtype=np.int64)
++    discretized = int(model.vocab_size) - token_ids
++    discretized = np.clip(discretized - 1, 0, model.bin_centers.shape[0] - 1)
++    normalized = model.bin_centers[discretized]
++
++    stats = model.get_action_stats(unnorm_key)
++    low = np.asarray(stats["q01"], dtype=np.float32)
++    high = np.asarray(stats["q99"], dtype=np.float32)
++    mask = np.asarray(stats.get("mask", np.ones_like(low, dtype=bool)), dtype=bool)
++    actions = np.where(mask, 0.5 * (normalized + 1.0) * (high - low) + low, normalized)
++    return np.asarray(actions, dtype=np.float32)
++
++
++def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
++    return tensor.detach().float().cpu().numpy()
++
++
++def write_json(path: Path, value: Any) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+diff --git a/deploy/tensorrt/export/00_dump_golden.py b/deploy/tensorrt/export/00_dump_golden.py
+new file mode 100755
+index 0000000..cac6ac8
+--- /dev/null
++++ b/deploy/tensorrt/export/00_dump_golden.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""Dump the tensors that form the PyTorch correctness oracle."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++from PIL import Image
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO_ROOT))
++
++from deploy.tensorrt.common import (  # noqa: E402
++    DEFAULT_INSTRUCTION,
++    DEFAULT_UNNORM_KEY,
++    action_token_bounds,
++    build_multimodal_inputs,
++    decode_action_tokens,
++    load_openvla,
++    move_batch_to_device,
++    prepare_action_prompt,
++    prompt_for,
++    tensor_to_numpy,
++    torch_dtype,
++    write_json,
++)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--image", type=Path, default=REPO_ROOT / "test_data/bridge_sample_0001.jpg")
++    parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
++    parser.add_argument("--unnorm-key", default=DEFAULT_UNNORM_KEY)
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
++    parser.add_argument(
++        "--skip-predict-action-check",
++        action="store_true",
++        help="Skip the extra stock predict_action pass used to verify the golden decode.",
++    )
++    parser.add_argument(
++        "--output-dir",
++        type=Path,
++        default=REPO_ROOT / "deploy/tensorrt/artifacts/golden/sample_0001",
++    )
++    return parser.parse_args()
++
++
++def main() -> None:
++    args = parse_args()
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++    processor, model = load_openvla(args.device, args.dtype)
++
++    image = Image.open(args.image).convert("RGB")
++    inputs = processor(prompt_for(args.instruction), image, return_tensors="pt")
++    inputs = move_batch_to_device(inputs, args.device, torch_dtype(args.dtype))
++    input_ids, attention_mask, appended_empty_token = prepare_action_prompt(
++        inputs["input_ids"], inputs.get("attention_mask")
++    )
++    action_dim = int(model.get_action_dim(args.unnorm_key))
++
++    with torch.inference_mode():
++        patch_features = model.vision_backbone(inputs["pixel_values"])
++        projected = model.projector(patch_features)
++        multimodal_embeddings, multimodal_attention_mask = build_multimodal_inputs(
++            model, input_ids, attention_mask, projected
++        )
++        generated_ids = model.generate(
++            input_ids=input_ids,
++            attention_mask=attention_mask,
++            pixel_values=inputs["pixel_values"],
++            max_new_tokens=action_dim,
++            do_sample=False,
++        )
++        stock_action = None
++        if not args.skip_predict_action_check:
++            stock_action = model.predict_action(
++                **inputs,
++                unnorm_key=args.unnorm_key,
++                do_sample=False,
++            )
++
++    action_token_ids = generated_ids[0, -action_dim:].detach().cpu().numpy()
++    action = decode_action_tokens(model, action_token_ids, args.unnorm_key)
++    stock_action_max_abs_error = None
++    if stock_action is not None:
++        stock_action = np.asarray(stock_action, dtype=np.float32)
++        stock_action_max_abs_error = float(np.max(np.abs(action - stock_action)))
++    low_token, high_token = action_token_bounds(model)
++
++    np.save(args.output_dir / "input_ids.npy", input_ids.detach().cpu().numpy())
++    if attention_mask is not None:
++        np.save(args.output_dir / "attention_mask.npy", attention_mask.detach().cpu().numpy())
++    np.save(args.output_dir / "pixel_values.npy", tensor_to_numpy(inputs["pixel_values"]))
++    np.save(args.output_dir / "patch_features.npy", tensor_to_numpy(patch_features))
++    np.save(args.output_dir / "projected_patch_embeddings.npy", tensor_to_numpy(projected))
++    np.save(args.output_dir / "multimodal_embeddings.npy", tensor_to_numpy(multimodal_embeddings))
++    if multimodal_attention_mask is not None:
++        np.save(
++            args.output_dir / "multimodal_attention_mask.npy",
++            multimodal_attention_mask.detach().cpu().numpy(),
++        )
++    np.save(args.output_dir / "generated_token_ids.npy", action_token_ids)
++    np.save(args.output_dir / "action.npy", action)
++
++    tokens_in_action_range = bool(np.all((action_token_ids >= low_token) & (action_token_ids <= high_token)))
++    metadata = {
++        "image": str(args.image.resolve()),
++        "instruction": args.instruction,
++        "unnorm_key": args.unnorm_key,
++        "dtype": args.dtype,
++        "empty_token_appended": appended_empty_token,
++        "action_dim": action_dim,
++        "effective_vocab_size": int(model.vocab_size),
++        "padded_lm_head_size": int(model.config.text_config.vocab_size),
++        "n_action_tokens": int(model.config.n_action_bins),
++        "n_bin_centers": int(model.bin_centers.shape[0]),
++        "action_token_id_min": low_token,
++        "action_token_id_max": high_token,
++        "tokens_in_action_range": tokens_in_action_range,
++        "shapes": {
++            "input_ids": list(input_ids.shape),
++            "pixel_values": list(inputs["pixel_values"].shape),
++            "patch_features": list(patch_features.shape),
++            "projected_patch_embeddings": list(projected.shape),
++            "multimodal_embeddings": list(multimodal_embeddings.shape),
++        },
++        "generated_token_ids": action_token_ids.tolist(),
++        "action": action.tolist(),
++        "stock_predict_action_max_abs_error": stock_action_max_abs_error,
++    }
++    write_json(args.output_dir / "metadata.json", metadata)
++    print(f"Golden dump written to {args.output_dir}")
++    print(metadata)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/deploy/tensorrt/export/01_export_vision_projector_onnx.py b/deploy/tensorrt/export/01_export_vision_projector_onnx.py
+new file mode 100755
+index 0000000..d606afd
+--- /dev/null
++++ b/deploy/tensorrt/export/01_export_vision_projector_onnx.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++"""Export the fused DINOv2 + SigLIP + projector graph as fixed-shape ONNX."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++import torch
++from torch import nn
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO_ROOT))
++
++from deploy.tensorrt.common import load_openvla, write_json  # noqa: E402
++
++
++class VisionProjectorWrapper(nn.Module):
++    def __init__(self, model: nn.Module) -> None:
++        super().__init__()
++        self.vision_backbone = model.vision_backbone
++        self.projector = model.projector
++
++    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
++        return self.projector(self.vision_backbone(pixel_values))
++
++
++class FeaturizerWrapper(nn.Module):
++    def __init__(self, featurizer: nn.Module) -> None:
++        super().__init__()
++        self.featurizer = featurizer
++
++    def forward(self, image: torch.Tensor) -> torch.Tensor:
++        return self.featurizer(image)
++
++
++class ProjectorWrapper(nn.Module):
++    def __init__(self, projector: nn.Module) -> None:
++        super().__init__()
++        self.projector = projector
++
++    def forward(self, patch_features: torch.Tensor) -> torch.Tensor:
++        return self.projector(patch_features)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--opset", type=int, default=17)
++    parser.add_argument(
++        "--mode",
++        choices=("combined", "split"),
++        default="combined",
++        help="Use split mode to isolate DINO, SigLIP, or projector export failures.",
++    )
++    parser.add_argument(
++        "--output",
++        type=Path,
++        default=REPO_ROOT / "deploy/tensorrt/artifacts/onnx/vision_projector_fp16.onnx",
++    )
++    return parser.parse_args()
++
++
++def export_module(
++    module: nn.Module,
++    example: torch.Tensor,
++    output: Path,
++    input_name: str,
++    output_name: str,
++    opset: int,
++) -> list[int]:
++    output.parent.mkdir(parents=True, exist_ok=True)
++    with torch.inference_mode():
++        expected = module(example)
++        torch.onnx.export(
++            module,
++            (example,),
++            str(output),
++            input_names=[input_name],
++            output_names=[output_name],
++            opset_version=opset,
++            do_constant_folding=True,
++            dynamic_axes=None,
++        )
++    return list(expected.shape)
++
++
++def main() -> None:
++    args = parse_args()
++    if not args.device.startswith("cuda"):
++        raise SystemExit("FP16 vision export must run on CUDA for this model.")
++
++    _, model = load_openvla(args.device, "fp16")
++    channels = 6 if model.config.use_fused_vision_backbone else 3
++    image_sizes = list(model.config.image_sizes)
++    if len(set(image_sizes)) != 1:
++        raise SystemExit(f"One fixed tensor cannot represent different branch sizes: {image_sizes}")
++    image_size = int(image_sizes[0])
++    dummy = torch.zeros((1, channels, image_size, image_size), dtype=torch.float16, device=args.device)
++
++    if args.mode == "combined":
++        output_shape = export_module(
++            VisionProjectorWrapper(model).eval(),
++            dummy,
++            args.output,
++            "pixel_values",
++            "projected_patch_embeddings",
++            args.opset,
++        )
++    else:
++        if not model.config.use_fused_vision_backbone:
++            raise SystemExit("Split mode currently targets OpenVLA's fused DINOv2 + SigLIP backbone.")
++        split_dir = args.output.parent / "split"
++        image_a, image_b = torch.split(dummy, [3, 3], dim=1)
++        dino = FeaturizerWrapper(model.vision_backbone.featurizer).eval()
++        siglip = FeaturizerWrapper(model.vision_backbone.fused_featurizer).eval()
++        dino_shape = export_module(dino, image_a, split_dir / "dino_fp16.onnx", "image", "patches", args.opset)
++        siglip_shape = export_module(
++            siglip, image_b, split_dir / "siglip_fp16.onnx", "image", "patches", args.opset
++        )
++        with torch.inference_mode():
++            patch_features = torch.cat([dino(image_a), siglip(image_b)], dim=2)
++        output_shape = export_module(
++            ProjectorWrapper(model.projector).eval(),
++            patch_features,
++            split_dir / "projector_fp16.onnx",
++            "patch_features",
++            "projected_patch_embeddings",
++            args.opset,
++        )
++        write_json(
++            split_dir / "manifest.json",
++            {
++                "dino_output_shape": dino_shape,
++                "siglip_output_shape": siglip_shape,
++                "projector_input_shape": list(patch_features.shape),
++                "projector_output_shape": output_shape,
++            },
++        )
++        print(f"Exported split graphs under {split_dir}")
++        return
++
++    manifest = {
++        "precision": "fp16",
++        "opset": args.opset,
++        "input_name": "pixel_values",
++        "input_shape": list(dummy.shape),
++        "output_name": "projected_patch_embeddings",
++        "output_shape": output_shape,
++        "vision_backbone_id": model.config.vision_backbone_id,
++        "fixed_shape": True,
++    }
++    write_json(args.output.with_suffix(".manifest.json"), manifest)
++    print(f"Exported {args.output}")
++    print(manifest)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/deploy/tensorrt/export/02_extract_llama_checkpoint.py b/deploy/tensorrt/export/02_extract_llama_checkpoint.py
+new file mode 100755
+index 0000000..74e69bf
+--- /dev/null
++++ b/deploy/tensorrt/export/02_extract_llama_checkpoint.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python3
++"""Extract the fine-tuned OpenVLA Llama weights for an Edge-LLM export probe."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO_ROOT))
++
++from deploy.tensorrt.common import load_openvla, write_json  # noqa: E402
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--device", default="cpu")
++    parser.add_argument(
++        "--output-dir",
++        type=Path,
++        default=REPO_ROOT / "deploy/tensorrt/artifacts/hf_llama",
++    )
++    args = parser.parse_args()
++
++    processor, model = load_openvla(args.device, "bf16")
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++    model.language_model.save_pretrained(args.output_dir, safe_serialization=True)
++    processor.tokenizer.save_pretrained(args.output_dir)
++    write_json(
++        args.output_dir / "openvla_extraction.json",
++        {
++            "source_architecture": model.__class__.__name__,
++            "language_model_architecture": model.language_model.__class__.__name__,
++            "model_type": model.language_model.config.model_type,
++            "effective_vocab_size": int(model.vocab_size),
++            "padded_vocab_size": int(model.config.text_config.vocab_size),
++            "warning": "Llama 2 is not explicitly listed in the Edge-LLM support matrix; export is a compatibility probe.",
++        },
++    )
++    print(f"Extracted OpenVLA language model to {args.output_dir}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/deploy/tensorrt/export/03_export_action_meta.py b/deploy/tensorrt/export/03_export_action_meta.py
+new file mode 100755
+index 0000000..ec6d13b
+--- /dev/null
++++ b/deploy/tensorrt/export/03_export_action_meta.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""Export the deterministic action detokenization contract."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++import numpy as np
++from transformers import AutoConfig
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO_ROOT))
++
++from deploy.tensorrt.common import DEFAULT_UNNORM_KEY, EMPTY_TOKEN_ID, write_json  # noqa: E402
++from runtime_env import MODEL_PATH, MODEL_REVISION  # noqa: E402
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--unnorm-key", default=DEFAULT_UNNORM_KEY)
++    parser.add_argument(
++        "--output",
++        type=Path,
++        default=REPO_ROOT / "deploy/tensorrt/artifacts/action_meta/action_meta.json",
++    )
++    args = parser.parse_args()
++
++    config = AutoConfig.from_pretrained(
++        MODEL_PATH,
++        revision=MODEL_REVISION,
++        trust_remote_code=True,
++        local_files_only=True,
++    )
++    if args.unnorm_key not in config.norm_stats:
++        raise SystemExit(f"Unknown unnorm key {args.unnorm_key!r}; choices={sorted(config.norm_stats)}")
++    stats = config.norm_stats[args.unnorm_key]["action"]
++    effective_vocab_size = int(config.text_config.vocab_size - config.pad_to_multiple_of)
++    n_action_tokens = int(config.n_action_bins)
++    low_token, high_token = effective_vocab_size - n_action_tokens, effective_vocab_size - 1
++    bins = np.linspace(-1, 1, n_action_tokens)
++    bin_centers = (bins[:-1] + bins[1:]) / 2.0
++    action_dim = len(stats["q01"])
++    value = {
++        "unnorm_key": args.unnorm_key,
++        "empty_token_id": EMPTY_TOKEN_ID,
++        "action_dim": action_dim,
++        "n_action_tokens": n_action_tokens,
++        "n_bin_centers": int(bin_centers.shape[0]),
++        "effective_vocab_size": effective_vocab_size,
++        "padded_lm_head_size": int(config.text_config.vocab_size),
++        "action_token_id_min": low_token,
++        "action_token_id_max": high_token,
++        "bin_centers": bin_centers.astype(float).tolist(),
++        "q01": list(stats["q01"]),
++        "q99": list(stats["q99"]),
++        "mask": list(stats.get("mask", [True] * action_dim)),
++    }
++    write_json(args.output, value)
++    print(f"Wrote {args.output}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/deploy/tensorrt/runtime/__init__.py b/deploy/tensorrt/runtime/__init__.py
+new file mode 100644
+index 0000000..1ddc01c
+--- /dev/null
++++ b/deploy/tensorrt/runtime/__init__.py
+@@ -0,0 +1 @@
++"""Runtime components for hybrid TensorRT/PyTorch inference."""
+diff --git a/deploy/tensorrt/runtime/cpp/CMakeLists.txt b/deploy/tensorrt/runtime/cpp/CMakeLists.txt
+new file mode 100644
+index 0000000..1eabe9a
+--- /dev/null
++++ b/deploy/tensorrt/runtime/cpp/CMakeLists.txt
+@@ -0,0 +1,12 @@
++cmake_minimum_required(VERSION 3.16)
++project(openvla_action_decoder LANGUAGES CXX)
++
++add_library(openvla_action_decoder STATIC action_decoder.cpp)
++target_include_directories(openvla_action_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_compile_features(openvla_action_decoder PUBLIC cxx_std_17)
++
++add_executable(action_decoder_test action_decoder_test.cpp)
++target_link_libraries(action_decoder_test PRIVATE openvla_action_decoder)
++
++include(CTest)
++add_test(NAME action_decoder_test COMMAND action_decoder_test)
+diff --git a/deploy/tensorrt/runtime/cpp/action_decoder.cpp b/deploy/tensorrt/runtime/cpp/action_decoder.cpp
+new file mode 100644
+index 0000000..b6a619c
+--- /dev/null
++++ b/deploy/tensorrt/runtime/cpp/action_decoder.cpp
+@@ -0,0 +1,54 @@
++#include "action_decoder.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <stdexcept>
++#include <utility>
++
++namespace openvla
++{
++
++ActionDecoder::ActionDecoder(ActionMetadata metadata)
++    : metadata_(std::move(metadata))
++{
++    auto const actionDim = metadata_.q01.size();
++    if (metadata_.effectiveVocabSize <= 0 || metadata_.binCenters.empty())
++    {
++        throw std::invalid_argument("Action metadata has an empty vocabulary or bin table");
++    }
++    if (metadata_.q99.size() != actionDim || metadata_.mask.size() != actionDim)
++    {
++        throw std::invalid_argument("q01, q99, and mask must have the same action dimension");
++    }
++}
++
++std::vector<float> ActionDecoder::decode(
++    std::vector<std::int32_t> const& tokenIds) const
++{
++    if (tokenIds.size() != metadata_.q01.size())
++    {
++        throw std::invalid_argument("Token count does not match the configured action dimension");
++    }
++
++    std::vector<float> actions(tokenIds.size());
++    auto const maxBin = static_cast<std::int32_t>(metadata_.binCenters.size() - 1U);
++    for (std::size_t index = 0; index < tokenIds.size(); ++index)
++    {
++        auto discrete = metadata_.effectiveVocabSize - tokenIds[index] - 1;
++        discrete = std::clamp(discrete, 0, maxBin);
++        auto const normalized = metadata_.binCenters[static_cast<std::size_t>(discrete)];
++        if (metadata_.mask[index] != 0U)
++        {
++            actions[index] = 0.5F * (normalized + 1.0F)
++                * (metadata_.q99[index] - metadata_.q01[index])
++                + metadata_.q01[index];
++        }
++        else
++        {
++            actions[index] = normalized;
++        }
++    }
++    return actions;
++}
++
++}  // namespace openvla
+diff --git a/deploy/tensorrt/runtime/cpp/action_decoder.h b/deploy/tensorrt/runtime/cpp/action_decoder.h
+new file mode 100644
+index 0000000..8e7d3cd
+--- /dev/null
++++ b/deploy/tensorrt/runtime/cpp/action_decoder.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++namespace openvla
++{
++
++struct ActionMetadata
++{
++    std::int32_t effectiveVocabSize{};
++    std::vector<float> binCenters;
++    std::vector<float> q01;
++    std::vector<float> q99;
++    std::vector<std::uint8_t> mask;
++};
++
++class ActionDecoder
++{
++public:
++    explicit ActionDecoder(ActionMetadata metadata);
++
++    [[nodiscard]] std::vector<float> decode(
++        std::vector<std::int32_t> const& tokenIds) const;
++
++private:
++    ActionMetadata metadata_;
++};
++
++}  // namespace openvla
+diff --git a/deploy/tensorrt/runtime/cpp/action_decoder_test.cpp b/deploy/tensorrt/runtime/cpp/action_decoder_test.cpp
+new file mode 100644
+index 0000000..42cc28d
+--- /dev/null
++++ b/deploy/tensorrt/runtime/cpp/action_decoder_test.cpp
+@@ -0,0 +1,24 @@
++#include "action_decoder.h"
++
++#include <cassert>
++#include <cmath>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++int main()
++{
++    openvla::ActionMetadata metadata;
++    metadata.effectiveVocabSize = 32000;
++    metadata.binCenters = {-0.5F, 0.0F, 0.5F};
++    metadata.q01 = {-2.0F, -1.0F};
++    metadata.q99 = {2.0F, 1.0F};
++    metadata.mask = {1U, 0U};
++
++    openvla::ActionDecoder decoder(std::move(metadata));
++    auto const action = decoder.decode(std::vector<std::int32_t>{31999, 31997});
++    assert(action.size() == 2U);
++    assert(std::abs(action[0] - (-1.0F)) < 1.0e-6F);
++    assert(std::abs(action[1] - 0.5F) < 1.0e-6F);
++    return 0;
++}
+diff --git a/deploy/tensorrt/runtime/hybrid_runtime.py b/deploy/tensorrt/runtime/hybrid_runtime.py
+new file mode 100755
+index 0000000..bb6d5e5
+--- /dev/null
++++ b/deploy/tensorrt/runtime/hybrid_runtime.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++"""TensorRT vision + manual PyTorch Llama prefill/KV-cache/decode runtime."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++from PIL import Image
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO_ROOT))
++
++from deploy.tensorrt.common import (  # noqa: E402
++    DEFAULT_INSTRUCTION,
++    DEFAULT_UNNORM_KEY,
++    action_token_bounds,
++    build_multimodal_inputs,
++    decode_action_tokens,
++    load_openvla,
++    move_batch_to_device,
++    prepare_action_prompt,
++    prompt_for,
++    torch_dtype,
++)
++from deploy.tensorrt.runtime.trt_runner import TensorRTRunner  # noqa: E402
++
++
++def greedy_action_decode(
++    language_model: torch.nn.Module,
++    multimodal_embeddings: torch.Tensor,
++    multimodal_attention_mask: torch.Tensor | None,
++    action_dim: int,
++) -> torch.Tensor:
++    """Generate one token in prefill and ``action_dim - 1`` from the KV cache."""
++
++    outputs = language_model(
++        inputs_embeds=multimodal_embeddings,
++        attention_mask=multimodal_attention_mask,
++        use_cache=True,
++        return_dict=True,
++    )
++    past_key_values = outputs.past_key_values
++    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
++    generated = [next_token]
++
++    for _ in range(action_dim - 1):
++        outputs = language_model(
++            input_ids=next_token[:, None],
++            past_key_values=past_key_values,
++            use_cache=True,
++            return_dict=True,
++        )
++        past_key_values = outputs.past_key_values
++        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
++        generated.append(next_token)
++    return torch.stack(generated, dim=1)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--engine", type=Path, required=True)
++    parser.add_argument("--image", type=Path, default=REPO_ROOT / "test_data/bridge_sample_0001.jpg")
++    parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
++    parser.add_argument("--unnorm-key", default=DEFAULT_UNNORM_KEY)
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--llm-dtype", choices=("bf16", "fp16"), default="bf16")
++    parser.add_argument("--compare-reference", action="store_true")
++    args = parser.parse_args()
++
++    processor, model = load_openvla(args.device, args.llm_dtype)
++    runner = TensorRTRunner(args.engine, args.device)
++    image = Image.open(args.image).convert("RGB")
++    inputs = processor(prompt_for(args.instruction), image, return_tensors="pt")
++    inputs = move_batch_to_device(inputs, args.device, torch_dtype(args.llm_dtype))
++    input_ids, attention_mask, appended = prepare_action_prompt(inputs["input_ids"], inputs.get("attention_mask"))
++    action_dim = int(model.get_action_dim(args.unnorm_key))
++
++    with torch.inference_mode():
++        trt_outputs = runner({"pixel_values": inputs["pixel_values"]})
++        projected = trt_outputs["projected_patch_embeddings"]
++        multimodal_embeddings, multimodal_attention_mask = build_multimodal_inputs(
++            model, input_ids, attention_mask, projected
++        )
++        generated = greedy_action_decode(
++            model.language_model,
++            multimodal_embeddings,
++            multimodal_attention_mask,
++            action_dim,
++        )
++
++    token_ids = generated[0].detach().cpu().numpy()
++    action = decode_action_tokens(model, token_ids, args.unnorm_key)
++    low_token, high_token = action_token_bounds(model)
++    result: dict[str, object] = {
++        "token_ids": token_ids.tolist(),
++        "action": action.tolist(),
++        "empty_token_appended": appended,
++        "tokens_in_action_range": bool(np.all((token_ids >= low_token) & (token_ids <= high_token))),
++    }
++
++    if args.compare_reference:
++        with torch.inference_mode():
++            reference_ids = model.generate(
++                input_ids=input_ids,
++                attention_mask=attention_mask,
++                pixel_values=inputs["pixel_values"],
++                max_new_tokens=action_dim,
++                do_sample=False,
++            )[0, -action_dim:]
++        reference_np = reference_ids.detach().cpu().numpy()
++        reference_action = decode_action_tokens(model, reference_np, args.unnorm_key)
++        result.update(
++            {
++                "reference_token_ids": reference_np.tolist(),
++                "token_exact_match": bool(np.array_equal(token_ids, reference_np)),
++                "max_action_abs_error": float(np.max(np.abs(action - reference_action))),
++            }
++        )
++    print(json.dumps(result, indent=2, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/deploy/tensorrt/runtime/trt_runner.py b/deploy/tensorrt/runtime/trt_runner.py
+new file mode 100644
+index 0000000..38ea347
+--- /dev/null
++++ b/deploy/tensorrt/runtime/trt_runner.py
+@@ -0,0 +1,89 @@
++"""Small TensorRT 10 runner that uses torch tensors as CUDA buffers."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++import torch
++
++
++class TensorRTRunner:
++    def __init__(self, engine_path: Path | str, device: str = "cuda:0") -> None:
++        if not torch.cuda.is_available():
++            raise RuntimeError("TensorRT execution requires CUDA")
++        try:
++            import tensorrt as trt
++        except ImportError as exc:
++            raise RuntimeError("Install the JetPack-provided TensorRT Python package") from exc
++
++        self.trt = trt
++        self.device = torch.device(device)
++        self.logger = trt.Logger(trt.Logger.WARNING)
++        self.runtime = trt.Runtime(self.logger)
++        engine_bytes = Path(engine_path).read_bytes()
++        self.engine = self.runtime.deserialize_cuda_engine(engine_bytes)
++        if self.engine is None:
++            raise RuntimeError(f"Could not deserialize TensorRT engine: {engine_path}")
++        self.context = self.engine.create_execution_context()
++        if self.context is None:
++            raise RuntimeError("Could not create TensorRT execution context")
++
++        self.input_names: list[str] = []
++        self.output_names: list[str] = []
++        for index in range(self.engine.num_io_tensors):
++            name = self.engine.get_tensor_name(index)
++            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
++                self.input_names.append(name)
++            else:
++                self.output_names.append(name)
++
++    def _torch_dtype(self, trt_dtype: Any) -> torch.dtype:
++        mapping = {
++            self.trt.float32: torch.float32,
++            self.trt.float16: torch.float16,
++            self.trt.int32: torch.int32,
++            self.trt.int8: torch.int8,
++            self.trt.bool: torch.bool,
++        }
++        if hasattr(self.trt, "bfloat16"):
++            mapping[self.trt.bfloat16] = torch.bfloat16
++        try:
++            return mapping[trt_dtype]
++        except KeyError as exc:
++            raise TypeError(f"Unsupported TensorRT dtype: {trt_dtype}") from exc
++
++    def __call__(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
++        missing = set(self.input_names) - set(inputs)
++        extra = set(inputs) - set(self.input_names)
++        if missing or extra:
++            raise ValueError(f"Engine inputs mismatch; missing={sorted(missing)}, extra={sorted(extra)}")
++
++        bound_inputs: dict[str, torch.Tensor] = {}
++        for name in self.input_names:
++            tensor = inputs[name].to(
++                device=self.device,
++                dtype=self._torch_dtype(self.engine.get_tensor_dtype(name)),
++            ).contiguous()
++            if not self.context.set_input_shape(name, tuple(tensor.shape)):
++                raise RuntimeError(f"TensorRT rejected shape {tuple(tensor.shape)} for {name}")
++            self.context.set_tensor_address(name, tensor.data_ptr())
++            bound_inputs[name] = tensor
++
++        outputs: dict[str, torch.Tensor] = {}
++        for name in self.output_names:
++            shape = tuple(self.context.get_tensor_shape(name))
++            if any(dim < 0 for dim in shape):
++                raise RuntimeError(f"Unresolved output shape for {name}: {shape}")
++            tensor = torch.empty(
++                shape,
++                dtype=self._torch_dtype(self.engine.get_tensor_dtype(name)),
++                device=self.device,
++            )
++            self.context.set_tensor_address(name, tensor.data_ptr())
++            outputs[name] = tensor
++
++        stream = torch.cuda.current_stream(self.device)
++        if not self.context.execute_async_v3(stream.cuda_stream):
++            raise RuntimeError("TensorRT execute_async_v3 failed")
++        return outputs
+diff --git a/deploy/tensorrt/tests/test_common.py b/deploy/tensorrt/tests/test_common.py
+new file mode 100644
+index 0000000..2a9ebde
+--- /dev/null
++++ b/deploy/tensorrt/tests/test_common.py
+@@ -0,0 +1,37 @@
++from __future__ import annotations
++
++import numpy as np
++import torch
++
++
++def test_prepare_action_prompt_keeps_aligned_mask() -> None:
++    from deploy.tensorrt.common import EMPTY_TOKEN_ID, prepare_action_prompt
++
++    ids = torch.tensor([[1, 2]], dtype=torch.long)
++    mask = torch.ones_like(ids)
++    new_ids, new_mask, appended = prepare_action_prompt(ids, mask)
++    assert appended
++    assert new_ids.tolist() == [[1, 2, EMPTY_TOKEN_ID]]
++    assert new_mask is not None and new_mask.tolist() == [[1, 1, 1]]
++
++
++def test_action_token_range_has_256_symbols() -> None:
++    from deploy.tensorrt.common import action_token_bounds
++
++    class Config:
++        n_action_bins = 256
++
++    class Model:
++        vocab_size = 32000
++        config = Config()
++
++    low, high = action_token_bounds(Model())
++    assert (low, high) == (31744, 31999)
++    assert high - low + 1 == 256
++
++
++def test_top_action_symbol_clips_to_last_of_255_centers() -> None:
++    bins = np.linspace(-1, 1, 256)
++    centers = (bins[:-1] + bins[1:]) / 2
++    discrete = np.clip(32000 - np.array([31744]) - 1, 0, centers.shape[0] - 1)
++    assert discrete.tolist() == [254]
+diff --git a/deploy/tensorrt/validate/validate_vision_engine.py b/deploy/tensorrt/validate/validate_vision_engine.py
+new file mode 100755
+index 0000000..4d11874
+--- /dev/null
++++ b/deploy/tensorrt/validate/validate_vision_engine.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""Compare TensorRT projected vision embeddings against a golden dump."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++
++REPO_ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(REPO_ROOT))
++
++from deploy.tensorrt.runtime.trt_runner import TensorRTRunner  # noqa: E402
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--engine", type=Path, required=True)
++    parser.add_argument(
++        "--golden-dir",
++        type=Path,
++        default=REPO_ROOT / "deploy/tensorrt/artifacts/golden/sample_0001",
++    )
++    parser.add_argument("--device", default="cuda:0")
++    parser.add_argument("--min-cosine", type=float, default=0.999)
++    args = parser.parse_args()
++
++    pixel_values = torch.from_numpy(np.load(args.golden_dir / "pixel_values.npy")).to(args.device)
++    golden = np.load(args.golden_dir / "projected_patch_embeddings.npy").astype(np.float32)
++    runner = TensorRTRunner(args.engine, args.device)
++    output = runner({"pixel_values": pixel_values})["projected_patch_embeddings"]
++    torch.cuda.synchronize()
++    actual = output.float().cpu().numpy()
++
++    diff = np.abs(actual - golden)
++    golden_flat = golden.reshape(-1).astype(np.float64)
++    actual_flat = actual.reshape(-1).astype(np.float64)
++    denom = np.linalg.norm(golden_flat) * np.linalg.norm(actual_flat)
++    cosine = float(np.dot(golden_flat, actual_flat) / denom)
++    metrics = {
++        "shape": list(actual.shape),
++        "max_abs_error": float(diff.max()),
++        "mean_abs_error": float(diff.mean()),
++        "cosine_similarity": cosine,
++        "min_cosine": args.min_cosine,
++        "passed": cosine >= args.min_cosine,
++    }
++    print(json.dumps(metrics, indent=2))
++    if not metrics["passed"]:
++        raise SystemExit(2)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/benchmark_openvla_thor.py b/tools/benchmark_openvla_thor.py
+index f7a4912..7c582f9 100644
+--- a/tools/benchmark_openvla_thor.py
++++ b/tools/benchmark_openvla_thor.py
+@@ -352,7 +352,9 @@ def timed_generate_tokens(
+     # 在 LLM 性能分析里，它通常近似 prefill 阶段开销。
+     ttft_ms = (streamer.first_token_time - start) * 1000.0
+     decode_total_ms = total_ms - ttft_ms
+-    token_count = max(streamer.token_count, 1)
++    # TTFT already includes the first generated token. Only subsequent tokens
++    # belong in the average decode-token denominator.
++    decode_token_count = max(streamer.token_count - 1, 1)
+ 
+     return {
+         # generate() 整体耗时。
+@@ -365,7 +367,8 @@ def timed_generate_tokens(
+         # streamer 捕获的新 token 数。
+         "generate_token_count": streamer.token_count,
+         # decode 阶段平均每 token 耗时。
+-        "generate_time_per_decode_token_ms": decode_total_ms / token_count,
++        "generate_decode_token_count": max(streamer.token_count - 1, 0),
++        "generate_time_per_decode_token_ms": decode_total_ms / decode_token_count,
+     }
+ 
+ 
+@@ -401,8 +404,8 @@ def main() -> None:
+     parser.add_argument(
+         "--max-new-tokens",
+         type=int,
+-        default=64,
+-        help="只在 --measure-generate 时使用，控制 generate() 最多生成多少 token。",
++        default=None,
++        help="只在 --measure-generate 时使用；默认取 model.get_action_dim(unnorm_key)。",
+     )
+     parser.add_argument(
+         "--measure-generate",
+@@ -463,6 +466,7 @@ def main() -> None:
+ 
+     # 切换到 eval 模式，关闭 dropout 等训练行为。
+     model.eval()
++    generate_tokens = args.max_new_tokens or int(model.get_action_dim(UNNORM_KEY))
+ 
+     # Warmup 阶段。
+     # 第一次运行通常包含 CUDA kernel 初始化、内存分配、算子 cache 等冷启动开销。
+@@ -501,7 +505,7 @@ def main() -> None:
+                             processor,
+                             image,
+                             args.instruction,
+-                            args.max_new_tokens,
++                            generate_tokens,
+                         )
+                     )
+                 except Exception as exc:

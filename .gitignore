@@ -152,6 +152,9 @@ data/
 rollouts/
 wandb/
 
+# Generated TensorRT deployment artifacts (large and machine-specific)
+deploy/tensorrt/artifacts/
+
 
 *.json
 
@@ -161,3 +164,6 @@ hf_cache/
 
 *.jsonl
 *.txt
+!deploy/tensorrt/runtime/cpp/CMakeLists.txt
+!deploy/tensorrt/build/
+!deploy/tensorrt/build/build_vision_engine.sh

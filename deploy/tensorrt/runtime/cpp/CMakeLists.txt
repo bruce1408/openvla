@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.16)
+project(openvla_action_decoder LANGUAGES CXX)
+
+add_library(openvla_action_decoder STATIC action_decoder.cpp)
+target_include_directories(openvla_action_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(openvla_action_decoder PUBLIC cxx_std_17)
+
+add_executable(action_decoder_test action_decoder_test.cpp)
+target_link_libraries(action_decoder_test PRIVATE openvla_action_decoder)
+
+include(CTest)
+add_test(NAME action_decoder_test COMMAND action_decoder_test)
