@@ -121,18 +121,18 @@ torch.bfloat16
 
 | 脚本 | 用途 | 当前计时边界 | 默认预热/样本 |
 |---|---|---|---|
-| `test_openvla_local.py` | 冒烟测试 | 不统计延迟，只验证本地加载和动作输出 | 1 张 224×224 灰图 |
-| `benchmark_openvla_thor.py` | 基础端到端 benchmark | processor、H2D、`predict_action` 分开；图像在循环前创建/加载 | 默认 warmup 10、iters 100 |
-| `infer_batch.py` | 多张真实图批量推理 | 只统计 `predict_action`；processor/H2D 不计入；没有预热 | 默认全部匹配图片 |
-| `eval_latency.py` | 真实图分阶段延迟 | processor 开始到 action 返回；用同步 hook 拆 vision/projector/LLM | 默认 warmup 5、全部图片 |
+| `check_model.py` | 冒烟测试 | 不统计延迟，只验证本地加载和动作输出 | 1 张 224×224 灰图 |
+| `bench_e2e.py` | 基础端到端 benchmark | processor、H2D、`predict_action` 分开；图像在循环前创建/加载 | 默认 warmup 10、iters 100 |
+| `infer_images.py` | 多张真实图批量推理 | 只统计 `predict_action`；processor/H2D 不计入；没有预热 | 默认全部匹配图片 |
+| `bench_stages.py` | 真实图分阶段延迟 | processor 开始到 action 返回；用同步 hook 拆 vision/projector/LLM | 默认 warmup 5、全部图片 |
 | `eval_operators.py` | 算子、模块、shape 清单 | 一次 shape 收集、一次预热、一次 profiler 推理 | profiler 样本 1 次 |
 
 重要边界：
 
 - 所有延迟测试都 **不包含模型加载时间**；
-- `eval_latency.py` 在计时开始前已经执行 `Image.open(...).convert("RGB")`，所以 **不包含 JPEG 磁盘读取和 RGB 解码时间**；
+- `bench_stages.py` 在计时开始前已经执行 `Image.open(...).convert("RGB")`，所以 **不包含 JPEG 磁盘读取和 RGB 解码时间**；
 - 当前结果不包含相机采集、REST/网络、请求排队、机器人控制器和机械臂执行时间；
-- `eval_latency.py` 在各模块 hook 前后调用 `torch.cuda.synchronize()`，以避免把异步 kernel 提交时间误当成执行时间；同步/hook 本身也带来少量扰动；
+- `bench_stages.py` 在各模块 hook 前后调用 `torch.cuda.synchronize()`，以避免把异步 kernel 提交时间误当成执行时间；同步/hook 本身也带来少量扰动；
 - `other_ms` 是 `inference - vision - projector - LLM` 的残差，包含 embedding/拼接、token 选择、反离散化/反归一化、Python/hook 和同步开销，不能严格称为纯后处理。
 
 结果文件没有持久化完整命令行和 warmup 参数；下文的样本数、图片名、指令和模型配置可由日志直接确认，warmup 数量只能确认代码默认值，无法排除运行时被命令行覆盖。
@@ -199,7 +199,7 @@ torch.bfloat16
 
 ## 8. 冷启动与无预热批量推理
 
-`infer_batch.py` 没有 warmup。100 张日志 `openvla_infer_1783331395.jsonl` 中：
+`infer_images.py` 没有 warmup。100 张日志 `openvla_infer_1783331395.jsonl` 中：
 
 | 指标 | 值 |
 |---|---:|
@@ -328,7 +328,7 @@ Profiler 同时确认 `sdpa` 路径实际触发了 PyTorch Flash-SDPA kernel，�
 
 ```bash
 /home/bruce/miniconda3/envs/openvla5090/bin/python -u \
-  /workspace/openvla/tools/benchmark_openvla_thor.py \
+  /workspace/openvla/tools/bench_e2e.py \
   --warmup 10 \
   --iters 100
 ```
@@ -337,7 +337,7 @@ Profiler 同时确认 `sdpa` 路径实际触发了 PyTorch Flash-SDPA kernel，�
 
 ```bash
 /home/bruce/miniconda3/envs/openvla5090/bin/python -u \
-  /workspace/openvla/tools/infer_batch.py \
+  /workspace/openvla/tools/infer_images.py \
   --image-dir /workspace/openvla/test_data \
   --glob '*.jpg' \
   --instruction 'pick up the object' \
@@ -348,7 +348,7 @@ Profiler 同时确认 `sdpa` 路径实际触发了 PyTorch Flash-SDPA kernel，�
 
 ```bash
 /home/bruce/miniconda3/envs/openvla5090/bin/python -u \
-  /workspace/openvla/tools/eval_latency.py \
+  /workspace/openvla/tools/bench_stages.py \
   --image-dir /workspace/openvla/test_data \
   --glob '*.jpg' \
   --instruction 'pick up the object' \

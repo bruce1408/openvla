@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-RUNTIME_DIR = Path(__file__).resolve().parents[1]
+RUNTIME_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(RUNTIME_DIR))
 from runtime_env import MODEL_PATH, MODEL_REVISION
 
@@ -200,9 +200,9 @@ def main() -> None:
     if not images:
         raise SystemExit(f"No images matched {image_dir}/{args.glob}")
 
-    output_dir = Path(os.getenv("OPENVLA_PREFIX", str(RUNTIME_DIR))) / "logs"
+    output_dir = Path(os.getenv("OPENVLA_LOGS_DIR", "/workspace/outputs/openvla"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = Path(args.output) if args.output else output_dir / f"latency_breakdown_{int(time.time())}.jsonl"
+    output_path = Path(args.output) if args.output else output_dir / f"latency_breakdown_{time.strftime('%Y_%m%d_%H%M%S')}.jsonl"
     summary_path = output_path.with_suffix(".summary.json")
 
     print("model:", MODEL_ID)

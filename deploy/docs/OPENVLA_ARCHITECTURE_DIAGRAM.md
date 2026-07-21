@@ -52,7 +52,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A[test_openvla_local.py / benchmark_openvla_thor.py] --> B[AutoProcessor.from_pretrained]
+    A[check_model.py / bench_e2e.py] --> B[AutoProcessor.from_pretrained]
     A --> C[AutoModelForVision2Seq.from_pretrained]
 
     B --> D[processor(prompt, image)]
@@ -130,7 +130,7 @@ flowchart LR
 
 ## 6. Benchmark 脚本中测量的链路
 
-`benchmark_openvla_thor.py` 主要测下面这条链路：
+`bench_e2e.py` 主要测下面这条链路：
 
 ```mermaid
 flowchart LR

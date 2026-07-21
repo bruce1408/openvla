@@ -1,6 +1,6 @@
 # Toy OpenVLA 与官方 OpenVLA 对比文档
 
-本文档对比 `simple_openvla_toy.py`（教学用简化实现）与本仓库中 OpenVLA 官方实现（`prismatic/` 与 HF 移植版 `modeling_prismatic.py`），说明简化版替换了哪些部分，以及它们之间的对应关系。
+本文档对比 `toy_model.py`（教学用简化实现）与本仓库中 OpenVLA 官方实现（`prismatic/` 与 HF 移植版 `modeling_prismatic.py`），说明简化版替换了哪些部分，以及它们之间的对应关系。
 
 ---
 
@@ -22,7 +22,7 @@ RGB 图像 + 语言指令 → 视觉/文本特征 → 融合 → 动作 token �
 
 | 维度 | Toy 代码 | 官方 OpenVLA |
 |---|---|---|
-| 实现 | `TinyResNet16Backbone`，8 个残差块（`simple_openvla_toy.py:180`） | DINOv2 + SigLIP 双 ViT 融合（`prismatic/models/backbones/vision/dinosiglip_vit.py:21`） |
+| 实现 | `TinyResNet16Backbone`，8 个残差块（`toy_model.py:180`） | DINOv2 + SigLIP 双 ViT 融合（`prismatic/models/backbones/vision/dinosiglip_vit.py:21`） |
 | 输出 | 全局池化成**单个向量** `[B, 128]`（`:216`） | **patch token 序列** `[B, 256, 2176]`，两个 backbone 沿特征维 cat（`dinosiglip_vit.py:142`） |
 | 层选取 | 最后池化层 | 取**倒数第二层**的 patch tokens（`dinosiglip_vit.py:63`） |
 
@@ -32,7 +32,7 @@ RGB 图像 + 语言指令 → 视觉/文本特征 → 融合 → 动作 token �
 
 | 维度 | Toy 代码 | 官方 OpenVLA |
 |---|---|---|
-| 实现 | `TinyTextEncoder` = Embedding + 单层 GRU（`simple_openvla_toy.py:220`） | Llama-2-7B（`llama2-7b-pure`，`prismatic/models/backbones/llm/llama2.py:24`） |
+| 实现 | `TinyTextEncoder` = Embedding + 单层 GRU（`toy_model.py:220`） | Llama-2-7B（`llama2-7b-pure`，`prismatic/models/backbones/llm/llama2.py:24`） |
 | 分词 | 空白正则分词，词表 128（`SimpleTokenizer`，`:54`） | Llama-2 SentencePiece BPE，词表 32000 |
 | 句子表示 | GRU 最后隐藏状态 `[B, D]` | 自回归 decoder，不产生单一“句向量” |
 
@@ -42,7 +42,7 @@ RGB 图像 + 语言指令 → 视觉/文本特征 → 融合 → 动作 token �
 
 | 维度 | Toy 代码 | 官方 OpenVLA |
 |---|---|---|
-| 方式 | `cat([图像向量, 文本向量])` + 两层 MLP（`simple_openvla_toy.py:246`） | projector 把图像 patch 投影进 LLM token 空间，再作为 token 拼进序列 |
+| 方式 | `cat([图像向量, 文本向量])` + 两层 MLP（`toy_model.py:246`） | projector 把图像 patch 投影进 LLM token 空间，再作为 token 拼进序列 |
 | 融合位置 | 特征向量层面直接拼接 | **token 序列层面**：`cat([BOS, 图像tokens, 文本tokens])`（`prismatic/models/vlms/prismatic.py:389`） |
 | projector | 无（直接 MLP 融合） | `FusedMLPProjector`（`prismatic/util/nn_utils.py:37`），2176 维 → 4096 维 |
 
@@ -52,7 +52,7 @@ RGB 图像 + 语言指令 → 视觉/文本特征 → 融合 → 动作 token �
 
 | 维度 | Toy 代码 | 官方 OpenVLA |
 |---|---|---|
-| bins | 256 均匀分箱（`simple_openvla_toy.py:98`） | 256 均匀分箱（`prismatic/vla/action_tokenizer.py:31`） |
+| bins | 256 均匀分箱（`toy_model.py:98`） | 256 均匀分箱（`prismatic/vla/action_tokenizer.py:31`） |
 | 区间 | `[-1, 1]` | `[-1, 1]` |
 | bin 中心 | `bin_centers`（`:113`） | `bin_centers`（255 个，`action_tokenizer.py:32`） |
 | **bin ↔ 词表** | **独立分类头**，bin 索引直接是类别（`action_head`，`:253`） | **映射到 Llama 词表最后 256 个 token**：`token_id = vocab_size - bin`（`action_tokenizer.py:36`） |
@@ -63,7 +63,7 @@ RGB 图像 + 语言指令 → 视觉/文本特征 → 融合 → 动作 token �
 
 | 维度 | Toy 代码 | 官方 OpenVLA |
 |---|---|---|
-| 公式 | `0.5*(a+1)*(q99-q01)+q01`（`simple_openvla_toy.py:149`） | **完全相同**（`prismatic/models/vlas/openvla.py:94`） |
+| 公式 | `0.5*(a+1)*(q99-q01)+q01`（`toy_model.py:149`） | **完全相同**（`prismatic/models/vlas/openvla.py:94`） |
 | q01/q99 来源 | demo 里 =-1/1，恒等变换 | 来自各数据集 `norm_stats`（config.json 内 20+ 数据集统计） |
 | mask | 无 | per-dim mask，夹爪维（index 6）不做反归一化（`openvla.py:97`） |
 
@@ -73,13 +73,13 @@ RGB 图像 + 语言指令 → 视觉/文本特征 → 融合 → 动作 token �
 
 | 维度 | Toy 代码 | 官方 OpenVLA |
 |---|---|---|
-| 方式 | 分类头一次性输出，`argmax` 所有维（`simple_openvla_toy.py:296`） | 自回归 `generate`，逐 token 生成，`max_new_tokens=action_dim`（`openvla.py:79`） |
+| 方式 | 分类头一次性输出，`argmax` 所有维（`toy_model.py:296`） | 自回归 `generate`，逐 token 生成，`max_new_tokens=action_dim`（`openvla.py:79`） |
 
 **差异**：toy 一次前向并行出 7 维；官方 Llama 自回归逐个吐出 7 个 action token（贪心解码）。
 
 ### 2.7 Prompt 模板（几乎一致）
 
-- Toy：`In: What action should the robot take to {instruction}?\nOut:`（`simple_openvla_toy.py:361`）
+- Toy：`In: What action should the robot take to {instruction}?\nOut:`（`toy_model.py:361`）
 - 官方：`In: {msg}\nOut: `（`PurePromptBuilder`，`base_prompter.py:36`），msg = `What action should the robot take to {instruction}?`
 
 **差异**：官方 `Out:` 后有空格，且推理时补一个 SentencePiece 空 token（`29871`，`openvla.py:58`）对齐训练分词；toy 用简单分词器无需此步。
@@ -88,7 +88,7 @@ RGB 图像 + 语言指令 → 视觉/文本特征 → 融合 → 动作 token �
 
 | 维度 | Toy 代码 | 官方 OpenVLA |
 |---|---|---|
-| 损失 | 对 7 个动作维做交叉熵（`simple_openvla_toy.py:268`） | next-token 交叉熵，只在动作 token 上算损失 |
+| 损失 | 对 7 个动作维做交叉熵（`toy_model.py:268`） | next-token 交叉熵，只在动作 token 上算损失 |
 | mask | 无 | prompt/图像 token 全部 `IGNORE_INDEX=-100`，只对最后 `action_dim+1` 个 token 算 loss（`datasets.py:63`） |
 
 **差异**：本质都是对动作 bin 做交叉熵。官方在整条语言序列里 mask 掉非动作位置；toy 因用独立分类头天然只有动作输出，无需 mask。

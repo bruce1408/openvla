@@ -106,18 +106,18 @@ index 0000000..bebb149
 +
 +## 1. PyTorch baseline
 +
-+The formal end-to-end number comes from `benchmark_openvla_thor.py`. The hook-heavy `eval_latency.py` is for
++The formal end-to-end number comes from `bench_e2e.py`. The hook-heavy `bench_stages.py` is for
 +diagnosis because its synchronizations perturb natural asynchronous execution.
 +
 +```bash
-+python tools/benchmark_openvla_thor.py \
++python tools/bench_e2e.py \
 +  --image test_data/bridge_sample_0001.jpg \
 +  --instruction "pick up the blue object" \
 +  --warmup 10 \
 +  --iters 100 \
 +  --measure-generate
 +
-+python tools/eval_latency.py \
++python tools/bench_stages.py \
 +  --image-dir test_data \
 +  --glob '*.jpg' \
 +  --limit 20 \
@@ -1451,10 +1451,10 @@ index 0000000..4d11874
 +
 +if __name__ == "__main__":
 +    main()
-diff --git a/tools/benchmark_openvla_thor.py b/tools/benchmark_openvla_thor.py
+diff --git a/tools/bench_e2e.py b/tools/bench_e2e.py
 index f7a4912..7c582f9 100644
---- a/tools/benchmark_openvla_thor.py
-+++ b/tools/benchmark_openvla_thor.py
+--- a/tools/bench_e2e.py
++++ b/tools/bench_e2e.py
 @@ -352,7 +352,9 @@ def timed_generate_tokens(
      # 在 LLM 性能分析里，它通常近似 prefill 阶段开销。
      ttft_ms = (streamer.first_token_time - start) * 1000.0

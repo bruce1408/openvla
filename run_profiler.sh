@@ -11,12 +11,12 @@ cd "$SCRIPT_DIR"
 export OPENVLA_PREFIX="$RUNTIME_DIR"
 
 # 轻量 profile:trace 体积小,方便用 Perfetto 网页打开(定位瓶颈 2 步足够)
-python tools/profile_openvla.py --instruction "pick up the object" --active 2 --no-memory --no-stack
+python deploy/pytorch_bf16/prof_trace.py --instruction "pick up the object" --active 2 --no-memory --no-stack
 
 
 # 详细 profile(体积大,几百 MB,Perfetto 网页可能打不开;适合 TensorBoard/离线分析)
-# python tools/profile_openvla.py --instruction "pick up the object" --active 8 --tensorboard
+# python deploy/pytorch_bf16/prof_trace.py --instruction "pick up the object" --active 8 --tensorboard
 
 
 # 再用 benchmark 拿客观数字:
-# python tools/benchmark_openvla_thor.py --warmup 10 --iters 100 --measure-generate
+# python deploy/pytorch_bf16/bench_e2e.py --warmup 10 --iters 100 --measure-generate

@@ -39,7 +39,7 @@
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/tests/test_common.py` (+37 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/validate/validate_vision_engine.py` (+58 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/01_export_vision_projector_onnx.py` (+89 -14)
-> - Wrote `./work/openvla-cdd_dev/tools/benchmark_openvla_thor.py` (+9 -5)
+> - Wrote `./work/openvla-cdd_dev/tools/bench_e2e.py` (+9 -5)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/README.md` (+271 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/00_dump_golden.py` (+17 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/03_export_action_meta.py` (+27 -17)

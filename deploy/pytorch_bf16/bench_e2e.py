@@ -51,7 +51,7 @@ from typing import Any
 #   1. source env.sh；
 #   2. 设置 HF_HOME、TRANSFORMERS_OFFLINE 等 Hugging Face 离线缓存变量；
 #   3. 导出 MODEL_PATH，供下面 from_pretrained() 使用。
-RUNTIME_DIR = Path(__file__).resolve().parents[1]
+RUNTIME_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(RUNTIME_DIR))
 from runtime_env import MODEL_PATH, MODEL_REVISION
 
@@ -421,11 +421,12 @@ def main() -> None:
 
     # 日志目录默认是 $OPENVLA_PREFIX/logs。
     # OPENVLA_PREFIX 来自 env.sh，当前通常是 /workspace/openvla。
-    output_dir = Path(os.getenv("OPENVLA_PREFIX", ".")) / "logs"
+    # 默认输出到 /workspace/outputs/openvla,可用 OPENVLA_LOGS_DIR 覆盖
+    output_dir = Path(os.getenv("OPENVLA_LOGS_DIR", "/workspace/outputs/openvla"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # JSONL 文件保存每轮明细；summary JSON 保存统计汇总。
-    output_path = Path(args.output) if args.output else output_dir / f"openvla_thor_benchmark_{int(time.time())}.jsonl"
+    output_path = Path(args.output) if args.output else output_dir / f"openvla_thor_benchmark_{time.strftime('%Y_%m%d_%H%M%S')}.jsonl"
     summary_path = output_path.with_suffix(".summary.json")
 
     # 打印测试环境信息，方便终端记录和报告截图。

@@ -2,7 +2,7 @@ import os
 import sys
 from pathlib import Path
 
-RUNTIME_DIR = Path(__file__).resolve().parents[1]
+RUNTIME_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(RUNTIME_DIR))
 from runtime_env import ENV_SCRIPT, MODEL_PATH, MODEL_REVISION
 

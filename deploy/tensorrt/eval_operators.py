@@ -26,11 +26,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-RUNTIME_DIR = Path(__file__).resolve().parents[1]
+RUNTIME_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(RUNTIME_DIR))
 from runtime_env import MODEL_PATH, MODEL_REVISION
 
 import torch
+
 from PIL import Image
 from torch.profiler import profile, ProfilerActivity
 from transformers import AutoModelForVision2Seq, AutoProcessor

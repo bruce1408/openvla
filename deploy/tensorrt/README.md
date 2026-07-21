@@ -69,18 +69,18 @@ compare benchmark runs made under different modes.
 
 ## 1. PyTorch baseline
 
-The formal end-to-end number comes from `benchmark_openvla_thor.py`. The hook-heavy `eval_latency.py` is for
+The formal end-to-end number comes from `bench_e2e.py`. The hook-heavy `bench_stages.py` is for
 diagnosis because its synchronizations perturb natural asynchronous execution.
 
 ```bash
-python tools/benchmark_openvla_thor.py \
+python tools/bench_e2e.py \
   --image test_data/bridge_sample_0001.jpg \
   --instruction "pick up the blue object" \
   --warmup 10 \
   --iters 100 \
   --measure-generate
 
-python tools/eval_latency.py \
+python tools/bench_stages.py \
   --image-dir test_data \
   --glob '*.jpg' \
   --limit 20 \

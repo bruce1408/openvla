@@ -47,8 +47,8 @@
 
 ## 对现有 cdd_dev benchmark 的 Review
 
-- `tools/benchmark_openvla_thor.py` 适合作为正式 E2E 指标，因为它只在阶段边界同步。
-- `tools/eval_latency.py` 的多个 forward hook 会反复 `torch.cuda.synchronize()`，适合定位瓶颈，不适合作为最终生产 E2E 数字。
+- `tools/bench_e2e.py` 适合作为正式 E2E 指标，因为它只在阶段边界同步。
+- `tools/bench_stages.py` 的多个 forward hook 会反复 `torch.cuda.synchronize()`，适合定位瓶颈，不适合作为最终生产 E2E 数字。
 - `other_ms` 是推理总耗时减去已打点 GPU 阶段后的残差，包含 embedding、拼接、HF generate 调度、采样和后处理等，不能标成纯 postprocess。
 - 7 维动作通常表现为一次 prefill 生成第一个 token，再执行 6 次 cached decode。
 - 原 benchmark 的 decode 平均值用全部生成 token 数作为分母，但 TTFT 已包含首 token；实现已修正为只用后续 decode token 数。

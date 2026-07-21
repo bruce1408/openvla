@@ -81,8 +81,8 @@ image = Image.new("RGB", (224, 224), color=(128, 128, 128))
 
 对应代码位置：
 
-- `tools/test_openvla_local.py`
-- `tools/benchmark_openvla_thor.py`
+- `tools/check_model.py`
+- `tools/bench_e2e.py`
 - `prismatic/extern/hf/processing_prismatic.py`
 
 ### 3.2 语言输入
@@ -309,8 +309,8 @@ unnorm_key="bridge_orig"
 ```text
 env.sh
 runtime_env.py
-tools/test_openvla_local.py
-tools/benchmark_openvla_thor.py
+tools/check_model.py
+tools/bench_e2e.py
 ```
 
 ### 7.1 env.sh
@@ -361,7 +361,7 @@ processor = AutoProcessor.from_pretrained(
 
 `local_files_only=True` 表示只从本地缓存加载，不联网下载。
 
-### 7.3 test_openvla_local.py
+### 7.3 check_model.py
 
 这是最小功能验证脚本。它会：
 
@@ -374,7 +374,7 @@ processor = AutoProcessor.from_pretrained(
 
 适合用于确认：模型能不能加载、CUDA 能不能用、action 是否能正常输出。
 
-### 7.4 benchmark_openvla_thor.py
+### 7.4 bench_e2e.py
 
 这是性能评测脚本。它不只看能不能跑，还会统计：
 
@@ -481,7 +481,7 @@ OpenVLA 输出的 action 是连续向量，但它不是绝对通用的机器人�
 
 ## 11. 与评测脚本的关系
 
-`benchmark_openvla_thor.py` 测的是模型侧延迟，不包含完整机器人系统延迟。
+`bench_e2e.py` 测的是模型侧延迟，不包含完整机器人系统延迟。
 
 它包含：
 
@@ -529,9 +529,9 @@ OpenVLA 使用 `trust_remote_code=True` 加载自定义代码。固定 revision 
 | OpenVLA `predict_action()` 实现 | `prismatic/models/vlas/openvla.py` |
 | 动作 token 离散化/解码 | `prismatic/vla/action_tokenizer.py` |
 | Runtime 环境加载 | `runtime_env.py` |
-| 最小本地推理测试 | `tools/test_openvla_local.py` |
-| Thor 端侧性能评测 | `tools/benchmark_openvla_thor.py` |
-| 工具版 benchmark | `tools/benchmark_openvla_thor.py` |
+| 最小本地推理测试 | `tools/check_model.py` |
+| Thor 端侧性能评测 | `tools/bench_e2e.py` |
+| 工具版 benchmark | `tools/bench_e2e.py` |
 
 ## 14. 一句话总结
 
