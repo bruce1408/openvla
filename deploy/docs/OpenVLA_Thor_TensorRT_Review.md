@@ -102,12 +102,12 @@ Cosine similarity 只能通过 Gate 2，不能代替 token 或 rollout 验证。
 在 Thor 上先只完成以下四条命令，并保留完整日志：
 
 ```bash
-python deploy/tensorrt/export/00_dump_golden.py --dtype bf16
+python deploy/tensorrt/pipeline/00_dump_golden.py --dtype bf16
 
-python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
+python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
   --mode combined --opset 17
 
-bash deploy/tensorrt/build/build_vision_engine.sh
+bash deploy/tensorrt/pipeline/05_build_vision_engine.sh
 
 python deploy/tensorrt/runtime/hybrid_runtime.py \
   --engine deploy/tensorrt/artifacts/engines/vision_projector_fp16.plan \

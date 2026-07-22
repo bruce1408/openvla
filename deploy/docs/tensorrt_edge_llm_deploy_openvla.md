@@ -27,22 +27,22 @@
 > - Wrote `./work/openvla-cdd_dev/.gitignore` (+4 -1)
 > - Wrote `./work/openvla-cdd_dev/deploy/__init__.py` (+1 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/__init__.py` (+1 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/build/build_vision_engine.sh` (+27 -0)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/05_build_vision_engine.sh` (+27 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/common.py` (+166 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/00_dump_golden.py` (+125 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/01_export_vision_projector_onnx.py` (+85 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/02_extract_llama_checkpoint.py` (+45 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/03_export_action_params.py` (+55 -0)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/00_dump_golden.py` (+125 -0)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py` (+85 -0)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py` (+45 -0)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/04_export_action_params.py` (+55 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/__init__.py` (+1 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/hybrid_runtime.py` (+128 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/trt_runner.py` (+89 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/tests/test_common.py` (+37 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/validate/validate_vision_engine.py` (+58 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/01_export_vision_projector_onnx.py` (+89 -14)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py` (+89 -14)
 > - Wrote `./work/openvla-cdd_dev/tools/bench_e2e.py` (+9 -5)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/README.md` (+271 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/00_dump_golden.py` (+17 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/03_export_action_params.py` (+27 -17)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/00_dump_golden.py` (+17 -0)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/pipeline/04_export_action_params.py` (+27 -17)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/README.md` (+11 -1)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/cpp/CMakeLists.txt` (+12 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/cpp/action_decoder.cpp` (+54 -0)
@@ -106,13 +106,13 @@ git apply /Users/brucetrie/Documents/Codex/2026-07-17/new-chat/outputs/openvla_t
 ```bash
 source env.sh
 
-python deploy/tensorrt/export/00_dump_golden.py --dtype bf16
+python deploy/tensorrt/pipeline/00_dump_golden.py --dtype bf16
 
-python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
+python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
   --mode combined \
   --opset 17
 
-bash deploy/tensorrt/build/build_vision_engine.sh
+bash deploy/tensorrt/pipeline/05_build_vision_engine.sh
 
 python deploy/tensorrt/validate/validate_vision_engine.py \
   --engine deploy/tensorrt/artifacts/engines/vision_projector_fp16.plan
@@ -274,7 +274,7 @@ tokens_in_action_range false = 0
 通过后就可以开始 Edge‑LLM compatibility probe：
 
 ```bash
-python deploy/tensorrt/export/03_export_action_params.py \
+python deploy/tensorrt/pipeline/04_export_action_params.py \
   --unnorm-key bridge_orig
 
 cmake -S deploy/tensorrt/runtime/cpp \
@@ -286,7 +286,7 @@ ctest \
   --test-dir deploy/tensorrt/runtime/cpp/build \
   --output-on-failure
 
-python deploy/tensorrt/export/02_extract_llama_checkpoint.py \
+python deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py \
   --device cpu
 
 tensorrt-edgellm-export \
@@ -437,7 +437,7 @@ cd /workspace/openvla
 source /opt/openvla-venv/bin/activate
 source env.sh
 
-python deploy/tensorrt/export/02_extract_llama_checkpoint.py \
+python deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py \
   --device cpu
 ```
 
@@ -611,7 +611,7 @@ rsync -avP \
 > #### 1. 导出动作元数据
 >
 > ```bash
-> python deploy/tensorrt/export/03_export_action_params.py \
+> python deploy/tensorrt/pipeline/04_export_action_params.py \
 >   --unnorm-key bridge_orig
 >
 > cat deploy/tensorrt/artifacts/action_meta/action_meta.json
@@ -650,7 +650,7 @@ rsync -avP \
 > #### 3. 提取 OpenVLA 内部的 Llama
 >
 > ```bash
-> python deploy/tensorrt/export/02_extract_llama_checkpoint.py \
+> python deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py \
 >   --device cpu
 > ```
 >
@@ -727,7 +727,7 @@ rsync -avP \
 > 你现在可以先在 Thor 上完成：
 >
 > ```text
-> 03_export_action_params.py
+> 04_export_action_params.py
 > → C++ Action Decoder 测试
 > → 02_extract_llama_checkpoint.py
 > → 检查 hf_llama 目录
@@ -903,7 +903,7 @@ source env.sh
 导出动作元数据：
 
 ```bash
-python deploy/tensorrt/export/03_export_action_params.py \
+python deploy/tensorrt/pipeline/04_export_action_params.py \
   --unnorm-key bridge_orig
 ```
 
@@ -927,7 +927,7 @@ ctest \
 提取微调后的 Llama：
 
 ```bash
-python deploy/tensorrt/export/02_extract_llama_checkpoint.py \
+python deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py \
   --device cpu
 ```
 

@@ -21,7 +21,7 @@ index ac96fbc..7981e79 100644
 +*.txt
 +!deploy/tensorrt/runtime/cpp/CMakeLists.txt
 +!deploy/tensorrt/build/
-+!deploy/tensorrt/build/build_vision_engine.sh
++!deploy/tensorrt/pipeline/05_build_vision_engine.sh
 diff --git a/deploy/__init__.py b/deploy/__init__.py
 new file mode 100644
 index 0000000..e30538a
@@ -67,7 +67,7 @@ index 0000000..bebb149
 +│   ├── 00_dump_golden.py
 +│   ├── 01_export_vision_projector_onnx.py
 +│   ├── 02_extract_llama_checkpoint.py
-+│   └── 03_export_action_params.py
++│   └── 04_export_action_params.py
 +├── build/build_vision_engine.sh
 +├── runtime/
 +│   ├── trt_runner.py
@@ -130,7 +130,7 @@ index 0000000..bebb149
 +## 2. Gate 1: dump the golden tensors
 +
 +```bash
-+python deploy/tensorrt/export/00_dump_golden.py \
++python deploy/tensorrt/pipeline/00_dump_golden.py \
 +  --image test_data/bridge_sample_0001.jpg \
 +  --instruction "pick up the blue object" \
 +  --unnorm-key bridge_orig \
@@ -153,7 +153,7 @@ index 0000000..bebb149
 +Export FP16 first:
 +
 +```bash
-+python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
++python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
 +  --mode combined \
 +  --opset 17
 +```
@@ -161,7 +161,7 @@ index 0000000..bebb149
 +If export fails, isolate the failing branch:
 +
 +```bash
-+python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
++python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
 +  --mode split \
 +  --opset 17
 +```
@@ -188,7 +188,7 @@ index 0000000..bebb149
 +plan built on a different GPU or TensorRT release.
 +
 +```bash
-+bash deploy/tensorrt/build/build_vision_engine.sh
++bash deploy/tensorrt/pipeline/05_build_vision_engine.sh
 +```
 +
 +The default command fixes the only supported input to `1x6x224x224`, enables FP16, and writes:
@@ -245,7 +245,7 @@ index 0000000..bebb149
 +## 7. Export the action sidecar
 +
 +```bash
-+python deploy/tensorrt/export/03_export_action_params.py \
++python deploy/tensorrt/pipeline/04_export_action_params.py \
 +  --unnorm-key bridge_orig
 +```
 +
@@ -269,7 +269,7 @@ index 0000000..bebb149
 +Extract the fine-tuned language model, not base Llama 2:
 +
 +```bash
-+python deploy/tensorrt/export/02_extract_llama_checkpoint.py \
++python deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py \
 +  --device cpu
 +```
 +
@@ -323,11 +323,11 @@ index 0000000..6d94b90
 +++ b/deploy/tensorrt/__init__.py
 @@ -0,0 +1 @@
 +"""TensorRT deployment utilities for OpenVLA."""
-diff --git a/deploy/tensorrt/build/build_vision_engine.sh b/deploy/tensorrt/build/build_vision_engine.sh
+diff --git a/deploy/tensorrt/pipeline/05_build_vision_engine.sh b/deploy/tensorrt/pipeline/05_build_vision_engine.sh
 new file mode 100755
 index 0000000..8fcc880
 --- /dev/null
-+++ b/deploy/tensorrt/build/build_vision_engine.sh
++++ b/deploy/tensorrt/pipeline/05_build_vision_engine.sh
 @@ -0,0 +1,27 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
@@ -528,11 +528,11 @@ index 0000000..33b334a
 +def write_json(path: Path, value: Any) -> None:
 +    path.parent.mkdir(parents=True, exist_ok=True)
 +    path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-diff --git a/deploy/tensorrt/export/00_dump_golden.py b/deploy/tensorrt/export/00_dump_golden.py
+diff --git a/deploy/tensorrt/pipeline/00_dump_golden.py b/deploy/tensorrt/pipeline/00_dump_golden.py
 new file mode 100755
 index 0000000..cac6ac8
 --- /dev/null
-+++ b/deploy/tensorrt/export/00_dump_golden.py
++++ b/deploy/tensorrt/pipeline/00_dump_golden.py
 @@ -0,0 +1,142 @@
 +#!/usr/bin/env python3
 +"""Dump the tensors that form the PyTorch correctness oracle."""
@@ -676,11 +676,11 @@ index 0000000..cac6ac8
 +
 +if __name__ == "__main__":
 +    main()
-diff --git a/deploy/tensorrt/export/01_export_vision_projector_onnx.py b/deploy/tensorrt/export/01_export_vision_projector_onnx.py
+diff --git a/deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py b/deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py
 new file mode 100755
 index 0000000..d606afd
 --- /dev/null
-+++ b/deploy/tensorrt/export/01_export_vision_projector_onnx.py
++++ b/deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py
 @@ -0,0 +1,160 @@
 +#!/usr/bin/env python3
 +"""Export the fused DINOv2 + SigLIP + projector graph as fixed-shape ONNX."""
@@ -842,11 +842,11 @@ index 0000000..d606afd
 +
 +if __name__ == "__main__":
 +    main()
-diff --git a/deploy/tensorrt/export/02_extract_llama_checkpoint.py b/deploy/tensorrt/export/02_extract_llama_checkpoint.py
+diff --git a/deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py b/deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py
 new file mode 100755
 index 0000000..74e69bf
 --- /dev/null
-+++ b/deploy/tensorrt/export/02_extract_llama_checkpoint.py
++++ b/deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py
 @@ -0,0 +1,45 @@
 +#!/usr/bin/env python3
 +"""Extract the fine-tuned OpenVLA Llama weights for an Edge-LLM export probe."""
@@ -893,11 +893,11 @@ index 0000000..74e69bf
 +
 +if __name__ == "__main__":
 +    main()
-diff --git a/deploy/tensorrt/export/03_export_action_params.py b/deploy/tensorrt/export/03_export_action_params.py
+diff --git a/deploy/tensorrt/pipeline/04_export_action_params.py b/deploy/tensorrt/pipeline/04_export_action_params.py
 new file mode 100755
 index 0000000..ec6d13b
 --- /dev/null
-+++ b/deploy/tensorrt/export/03_export_action_params.py
++++ b/deploy/tensorrt/pipeline/04_export_action_params.py
 @@ -0,0 +1,65 @@
 +#!/usr/bin/env python3
 +"""Export the deterministic action detokenization contract."""

@@ -26,12 +26,16 @@ Three constraints must be treated as gates, not assumptions:
 ```text
 deploy/tensorrt/
 ├── common.py
-├── export/
+├── pipeline/
 │   ├── 00_dump_golden.py
 │   ├── 01_export_vision_projector_onnx.py
 │   ├── 02_extract_llama_checkpoint.py
-│   └── 03_export_action_params.py
-├── build/build_vision_engine.sh
+│   ├── 03_convert_llm_x86.sh
+│   ├── 04_export_action_params.py
+│   ├── 05_build_vision_engine.sh
+│   ├── 06_measure_llm_latency.sh
+│   ├── 07_measure_e2e_latency.py
+│   └── 08_measure_component_latency.sh
 ├── runtime/
 │   ├── trt_runner.py
 │   ├── hybrid_runtime.py
@@ -93,7 +97,7 @@ excludes the first token, which is produced by prefill.
 ## 2. Gate 1: dump the golden tensors
 
 ```bash
-python deploy/tensorrt/export/00_dump_golden.py \
+python deploy/tensorrt/pipeline/00_dump_golden.py \
   --image test_data/bridge_sample_0001.jpg \
   --instruction "pick up the blue object" \
   --unnorm-key bridge_orig \
@@ -116,7 +120,7 @@ Repeat the dump on a representative fixed validation set, not only one image, be
 Export FP16 first:
 
 ```bash
-python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
+python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
   --mode combined \
   --opset 17
 ```
@@ -124,7 +128,7 @@ python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
 If export fails, isolate the failing branch:
 
 ```bash
-python deploy/tensorrt/export/01_export_vision_projector_onnx.py \
+python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
   --mode split \
   --opset 17
 ```
@@ -151,7 +155,7 @@ TensorRT plans are hardware/software-specific. Build the plan on the target Thor
 plan built on a different GPU or TensorRT release.
 
 ```bash
-bash deploy/tensorrt/build/build_vision_engine.sh
+bash deploy/tensorrt/pipeline/05_build_vision_engine.sh
 ```
 
 The default command fixes the only supported input to `1x6x224x224`, enables FP16, and writes:
@@ -208,7 +212,7 @@ When token 1 matches and a later token differs, inspect the cache length, positi
 ## 7. Export the action sidecar
 
 ```bash
-python deploy/tensorrt/export/03_export_action_params.py \
+python deploy/tensorrt/pipeline/04_export_action_params.py \
   --unnorm-key bridge_orig
 ```
 
@@ -232,7 +236,7 @@ public workflow is checkpoint -> `tensorrt-edgellm-export` -> `llm_build` -> C++
 Extract the fine-tuned language model, not base Llama 2:
 
 ```bash
-python deploy/tensorrt/export/02_extract_llama_checkpoint.py \
+python deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py \
   --device cpu
 ```
 
