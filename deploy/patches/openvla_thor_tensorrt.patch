@@ -67,7 +67,7 @@ index 0000000..bebb149
 +│   ├── 00_dump_golden.py
 +│   ├── 01_export_vision_projector_onnx.py
 +│   ├── 02_extract_llama_checkpoint.py
-+│   └── 03_export_action_meta.py
++│   └── 03_export_action_params.py
 +├── build/build_vision_engine.sh
 +├── runtime/
 +│   ├── trt_runner.py
@@ -245,7 +245,7 @@ index 0000000..bebb149
 +## 7. Export the action sidecar
 +
 +```bash
-+python deploy/tensorrt/export/03_export_action_meta.py \
++python deploy/tensorrt/export/03_export_action_params.py \
 +  --unnorm-key bridge_orig
 +```
 +
@@ -893,11 +893,11 @@ index 0000000..74e69bf
 +
 +if __name__ == "__main__":
 +    main()
-diff --git a/deploy/tensorrt/export/03_export_action_meta.py b/deploy/tensorrt/export/03_export_action_meta.py
+diff --git a/deploy/tensorrt/export/03_export_action_params.py b/deploy/tensorrt/export/03_export_action_params.py
 new file mode 100755
 index 0000000..ec6d13b
 --- /dev/null
-+++ b/deploy/tensorrt/export/03_export_action_meta.py
++++ b/deploy/tensorrt/export/03_export_action_params.py
 @@ -0,0 +1,65 @@
 +#!/usr/bin/env python3
 +"""Export the deterministic action detokenization contract."""

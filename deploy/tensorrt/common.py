@@ -6,11 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+# 必须在 import transformers 之前导入 runtime_env:
+# runtime_env 会 source env.sh 并设置 HF_HOME / HF_HUB_CACHE / TRANSFORMERS_CACHE 等。
+# huggingface_hub 在首次 import 时会把缓存路径冻结成模块常量,若晚于 transformers 导入,
+# 这些环境变量将不生效,离线加载会去错误的空 hub 目录从而报 LocalEntryNotFoundError。
+from runtime_env import MODEL_PATH, MODEL_REVISION  # noqa: E402  (must precede transformers)
+
 import numpy as np
 import torch
 from transformers import AutoModelForVision2Seq, AutoProcessor
-
-from runtime_env import MODEL_PATH, MODEL_REVISION
 
 
 EMPTY_TOKEN_ID = 29871

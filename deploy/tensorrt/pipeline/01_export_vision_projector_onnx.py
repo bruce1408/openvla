@@ -119,8 +119,10 @@ def main() -> None:
         siglip_shape = export_module(
             siglip, image_b, split_dir / "siglip_fp16.onnx", "image", "patches", args.opset
         )
+
         with torch.inference_mode():
             patch_features = torch.cat([dino(image_a), siglip(image_b)], dim=2)
+        
         output_shape = export_module(
             ProjectorWrapper(model.projector).eval(),
             patch_features,
@@ -129,6 +131,7 @@ def main() -> None:
             "projected_patch_embeddings",
             args.opset,
         )
+        
         write_json(
             split_dir / "manifest.json",
             {
@@ -151,6 +154,7 @@ def main() -> None:
         "vision_backbone_id": model.config.vision_backbone_id,
         "fixed_shape": True,
     }
+    
     write_json(args.output.with_suffix(".manifest.json"), manifest)
     print(f"Exported {args.output}")
     print(manifest)

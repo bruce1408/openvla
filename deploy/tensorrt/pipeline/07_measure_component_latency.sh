@@ -17,7 +17,7 @@
 #   - 不验证数值正确性,只测机械执行时延。
 #
 # 用法:
-#   bash deploy/tensorrt/build/benchmark_components.sh
+#   bash deploy/tensorrt/build/measure_component_latency.sh
 #
 # 可调环境变量:
 #   EDGE_LLM_DIR    Edge-LLM 仓库路径 (默认 /workspace/TensorRT-Edge-LLM)

@@ -30,7 +30,7 @@ deploy/tensorrt/
 │   ├── 00_dump_golden.py
 │   ├── 01_export_vision_projector_onnx.py
 │   ├── 02_extract_llama_checkpoint.py
-│   └── 03_export_action_meta.py
+│   └── 03_export_action_params.py
 ├── build/build_vision_engine.sh
 ├── runtime/
 │   ├── trt_runner.py
@@ -208,7 +208,7 @@ When token 1 matches and a later token differs, inspect the cache length, positi
 ## 7. Export the action sidecar
 
 ```bash
-python deploy/tensorrt/export/03_export_action_meta.py \
+python deploy/tensorrt/export/03_export_action_params.py \
   --unnorm-key bridge_orig
 ```
 

@@ -32,7 +32,7 @@
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/00_dump_golden.py` (+125 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/01_export_vision_projector_onnx.py` (+85 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/02_extract_llama_checkpoint.py` (+45 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/03_export_action_meta.py` (+55 -0)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/03_export_action_params.py` (+55 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/__init__.py` (+1 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/hybrid_runtime.py` (+128 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/trt_runner.py` (+89 -0)
@@ -42,7 +42,7 @@
 > - Wrote `./work/openvla-cdd_dev/tools/bench_e2e.py` (+9 -5)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/README.md` (+271 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/00_dump_golden.py` (+17 -0)
-> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/03_export_action_meta.py` (+27 -17)
+> - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/export/03_export_action_params.py` (+27 -17)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/README.md` (+11 -1)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/cpp/CMakeLists.txt` (+12 -0)
 > - Wrote `./work/openvla-cdd_dev/deploy/tensorrt/runtime/cpp/action_decoder.cpp` (+54 -0)
@@ -274,7 +274,7 @@ tokens_in_action_range false = 0
 通过后就可以开始 Edge‑LLM compatibility probe：
 
 ```bash
-python deploy/tensorrt/export/03_export_action_meta.py \
+python deploy/tensorrt/export/03_export_action_params.py \
   --unnorm-key bridge_orig
 
 cmake -S deploy/tensorrt/runtime/cpp \
@@ -611,7 +611,7 @@ rsync -avP \
 > #### 1. 导出动作元数据
 >
 > ```bash
-> python deploy/tensorrt/export/03_export_action_meta.py \
+> python deploy/tensorrt/export/03_export_action_params.py \
 >   --unnorm-key bridge_orig
 >
 > cat deploy/tensorrt/artifacts/action_meta/action_meta.json
@@ -727,7 +727,7 @@ rsync -avP \
 > 你现在可以先在 Thor 上完成：
 >
 > ```text
-> 03_export_action_meta.py
+> 03_export_action_params.py
 > → C++ Action Decoder 测试
 > → 02_extract_llama_checkpoint.py
 > → 检查 hf_llama 目录
@@ -903,7 +903,7 @@ source env.sh
 导出动作元数据：
 
 ```bash
-python deploy/tensorrt/export/03_export_action_meta.py \
+python deploy/tensorrt/export/03_export_action_params.py \
   --unnorm-key bridge_orig
 ```
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bench_llm.sh - OpenVLA LLM engine 时延基准 (支持 nvfp4 / fp8 切换)
+# measure_llm_latency.sh - 测量 LLM engine 的 prefill/decode 时延（支持 nvfp4 / fp8）
 # =============================================================================
 #
 # 用途:
@@ -8,8 +8,8 @@
 #   通过第一个参数选择精度 (nvfp4 或 fp8)。
 #
 # 用法:
-#   bash bench_llm.sh nvfp4
-#   bash bench_llm.sh fp8
+#   bash measure_llm_latency.sh nvfp4
+#   bash measure_llm_latency.sh fp8
 #
 # 可选环境变量:
 #   INPUT_LEN   prefill 输入长度 (默认 262 = 256 视觉 + 6 文本)
@@ -21,7 +21,7 @@ set -euo pipefail
 
 PRECISION="${1:-nvfp4}"
 if [[ "$PRECISION" != "nvfp4" && "$PRECISION" != "fp8" ]]; then
-  echo "用法: bash bench_llm.sh [nvfp4|fp8]" >&2
+  echo "用法: bash measure_llm_latency.sh [nvfp4|fp8]" >&2
   exit 1
 fi
 

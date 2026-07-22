@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# bench_e2e.py - OpenVLA 真端到端时延基准 (nvfp4 / fp8)
+# measure_e2e_latency.py - OpenVLA 真端到端时延测量 (nvfp4 / fp8)
 # =============================================================================
 #
 # 目标:
@@ -21,8 +21,8 @@
 #   等 task B 缝合完成后,本脚本可无缝替换为真正的 embedding 注入路径。
 #
 # 用法:
-#   python bench_e2e.py --precision nvfp4
-#   python bench_e2e.py --precision fp8 --iters 20 --warmup 5
+#   python measure_e2e_latency.py --precision nvfp4
+#   python measure_e2e_latency.py --precision fp8 --iters 20 --warmup 5
 # =============================================================================
 
 import argparse
