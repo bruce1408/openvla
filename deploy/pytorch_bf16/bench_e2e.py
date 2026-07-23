@@ -2,7 +2,7 @@
 
 用途
 ====
-这个脚本用于在 NVIDIA Thor / T5000 设备上评测 OpenVLA 的端侧单步动作推理性能。
+这个脚本用于在 NVIDIA Thor 设备上评测 OpenVLA 的端侧单步动作推理性能。
 它会加载本地 Hugging Face 缓存中的 OpenVLA 模型，构造一组「图像 + 语言指令」输入，
 反复调用 `model.predict_action()`，并把每次迭代的耗时记录到 JSONL 文件，最后生成一个
 summary JSON，方便写部署评测报告。
@@ -51,6 +51,7 @@ from typing import Any
 #   1. source env.sh；
 #   2. 设置 HF_HOME、TRANSFORMERS_OFFLINE 等 Hugging Face 离线缓存变量；
 #   3. 导出 MODEL_PATH，供下面 from_pretrained() 使用。
+
 RUNTIME_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(RUNTIME_DIR))
 from runtime_env import MODEL_PATH, MODEL_REVISION
@@ -104,10 +105,13 @@ class TokenTimingStreamer:
     def __init__(self) -> None:
         # 第一个新 token 产生的时间，用于计算 TTFT/time-to-first-token。
         self.first_token_time: float | None = None
+        
         # 最后一个新 token 产生的时间，当前代码主要保留这个字段用于后续扩展。
         self.last_token_time: float | None = None
+        
         # generate() 实际生成的新 token 数量。
         self.token_count = 0
+        
         # generate() 的 streamer 第一次 put() 往往会收到 prompt/input 本身，不是新生成 token。
         # 这里用 _seen_prompt 跳过第一次回调，避免把 prompt 当成 decode token 统计。
         self._seen_prompt = False
@@ -289,22 +293,29 @@ def timed_predict_action(model: Any, processor: Any, image: Image.Image, instruc
             do_sample=False,
         )
     sync()
+    
     infer_end = time.perf_counter()
 
     total_end = time.perf_counter()
+    
     return {
+        
         # 图像+文本预处理耗时，单位 ms。
         # 报告里可作为 I/O preprocessing latency。
         "processor_time_ms": (processor_end - processor_start) * 1000.0,
+        
         # CPU/host 到 GPU/device 的输入搬运耗时，单位 ms。
         "h2d_time_ms": (h2d_end - h2d_start) * 1000.0,
+        
         # predict_action 本身耗时，单位 ms。
         # 这是评估 OpenVLA 模型推理速度的核心指标。
         "predict_action_total_time_ms": (infer_end - infer_start) * 1000.0,
+        
         # 端到端模型侧耗时，单位 ms。
         # 近似等于 processor_time_ms + h2d_time_ms + predict_action_total_time_ms，
         # 但由于 Python 调度和计时代码开销，可能有极小差异。
         "model_e2e_time_ms": (total_end - total_start) * 1000.0,
+        
         # 动作输出预览。
         # OpenVLA 常见输出是 7 维连续动作：[x, y, z, roll, pitch, yaw, gripper]。
         # 这里只截取字符串前 160 个字符，避免日志过长。
@@ -352,6 +363,7 @@ def timed_generate_tokens(
     # 在 LLM 性能分析里，它通常近似 prefill 阶段开销。
     ttft_ms = (streamer.first_token_time - start) * 1000.0
     decode_total_ms = total_ms - ttft_ms
+    
     # TTFT already includes the first generated token. Only subsequent tokens
     # belong in the average decode-token denominator.
     decode_token_count = max(streamer.token_count - 1, 1)
@@ -359,13 +371,17 @@ def timed_generate_tokens(
     return {
         # generate() 整体耗时。
         "generate_total_time_ms": total_ms,
+    
         # 首 token 时间，也写成 prefill_total，便于报告按 prefill/decode 拆分。
         "generate_ttft_ms": ttft_ms,
         "generate_prefill_total_time_ms": ttft_ms,
+    
         # 除首 token 前等待外，剩余 decode 阶段总耗时。
         "generate_decode_total_time_ms": decode_total_ms,
+    
         # streamer 捕获的新 token 数。
         "generate_token_count": streamer.token_count,
+    
         # decode 阶段平均每 token 耗时。
         "generate_decode_token_count": max(streamer.token_count - 1, 0),
         "generate_time_per_decode_token_ms": decode_total_ms / decode_token_count,

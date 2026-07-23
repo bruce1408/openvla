@@ -79,6 +79,7 @@ def main() -> None:
         description="Profile OpenVLA inference with torch.profiler "
         "(Chrome trace + operator table + flamegraph stacks)."
     )
+    
     parser.add_argument("--image", default="/workspace/openvla/test_data/bridge_sample_0001.jpg", help="Path to an input image (default: gray 224x224).")
     parser.add_argument("--instruction", default="move the robot arm forward")
     parser.add_argument("--wait", type=int, default=1, help="Profiler schedule: idle steps before warmup.")
@@ -120,18 +121,21 @@ def main() -> None:
     print("torch:", torch.__version__)
     print("cuda runtime:", torch.version.cuda)
     print("cuda available:", torch.cuda.is_available())
+
     if torch.cuda.is_available():
         print("gpu:", torch.cuda.get_device_name(0))
         print("capability:", torch.cuda.get_device_capability(0))
         torch.cuda.reset_peak_memory_stats()
 
     image = load_image(args.image)
+
     processor = AutoProcessor.from_pretrained(
         MODEL_PATH,
         revision=MODEL_REVISION,
         trust_remote_code=True,
         local_files_only=True,
     )
+
     model = AutoModelForVision2Seq.from_pretrained(
         MODEL_PATH,
         revision=MODEL_REVISION,
@@ -141,6 +145,7 @@ def main() -> None:
         trust_remote_code=True,
         local_files_only=True,
     ).to(DEVICE)
+
     model.eval()
 
     inputs = processor(prompt_for(args.instruction), image).to(DEVICE, dtype=dtype())
@@ -195,6 +200,7 @@ def main() -> None:
         sort_by=sort_key,
         row_limit=args.row_limit,
     )
+
     table_path.write_text(table, encoding="utf-8")
     print("operator table:", table_path)
     print(table)

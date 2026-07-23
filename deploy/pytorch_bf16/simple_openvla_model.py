@@ -9,7 +9,9 @@ Simplifications compared with real OpenVLA:
 - Vision backbone: a tiny ResNet-16-like CNN instead of DINOv2 + SigLIP.
 - Language backbone: Embedding + GRU instead of Llama-2.
 - Multimodal fusion: concat + MLP instead of a full Prismatic VLM projector/LLM.
-- Action head: predicts one discrete bin per action dimension.
+- Autoregressive decoder: single-layer GRU instead of 32-layer Transformer,
+  but keeps the key mechanism: prefill + decode loop, action tokens at the
+  tail of the vocabulary, and token_id -> bin mapping.
 
 The goal is to make the model structure, training loss, and inference decoding
 clear enough to read and run on CPU.
@@ -39,12 +41,13 @@ class ToyOpenVLAConfig:
     改一个字段就能同步影响视觉、文本、融合、动作头的构建。
     """
 
-    image_size: int = 128     # 输入图像会被 resize 成 image_size x image_size 的正方形。
+    image_size: int = 224     # 输入图像会被 resize 成 image_size x image_size 的正方形（与官方 OpenVLA 一致）。
     vocab_size: int = 128     # 文本词表上限（含 <pad>/<unk>），真实 OpenVLA 用 Llama 的大词表。
     max_text_len: int = 32    # 指令 token 的固定长度，超过截断、不足用 <pad> 补齐。
-    text_dim: int = 128       # 文本编码器（Embedding + GRU）的隐藏维度。
-    vision_dim: int = 128     # 视觉编码器输出的图像特征向量维度。
-    fusion_dim: int = 256     # 图文特征融合后 MLP 的隐藏维度。
+    text_dim: int = 128       # 文本 embedding 维度。
+    vision_dim: int = 128     # 视觉编码器输出的每个 patch 的特征维度。
+    vision_patches: int = 16  # 视觉 patch 数量（4×4 网格），官方 OpenVLA 用 256 个 patch。
+    fusion_dim: int = 256     # 统一 token 维度（对应 Llama 的 hidden_size=4096，所有 token 对齐到此维度）。
     action_dim: int = 7       # 动作维度：7-DoF（xyz 位移 + 姿态 + 夹爪）。
     action_bins: int = 256    # 每个动作维度离散化成多少个 bin（分类类别数）。
     min_action: float = -1.0  # 归一化动作的下界，动作离散化/反离散化的区间左端。
@@ -63,6 +66,7 @@ class SimpleTokenizer:
 
     def __init__(self, vocab: dict[str, int] | None = None, max_len: int = 32) -> None:
         self.max_len = max_len
+        
         # 词表：词 -> 整数 id。默认只放两个特殊 token，其余通过 build_vocab 填充。
         self.vocab = vocab or {self.pad_token: 0, self.unk_token: 1}
 
@@ -90,6 +94,7 @@ class SimpleTokenizer:
         # 逐词查表转成 id，查不到的词用 <unk> 的 id 兜底。
         ids = [self.vocab.get(word, self.vocab[self.unk_token]) for word in self._words(text)]
         ids = ids[: self.max_len]  # 超长截断到 max_len。
+        
         # 不足 max_len 的部分用 <pad> 的 id 补齐，保证每条指令长度一致，方便组 batch。
         ids += [self.vocab[self.pad_token]] * (self.max_len - len(ids))
         return torch.tensor(ids, dtype=torch.long)
@@ -98,54 +103,65 @@ class SimpleTokenizer:
 class ActionTokenizer:
     """Discretizes continuous actions into bins and decodes bins back to floats.
 
-    Real OpenVLA maps action bins onto the tail of the LLM vocabulary. This toy
-    model predicts the bin index directly with a classification head, which is
-    easier to inspect but equivalent for understanding training/inference.
+    与官方 OpenVLA (prismatic/vla/action_tokenizer.py) 完全一致的实现：
+    - bins = linspace(-1, 1, 256)  → 256 个边界点 → 255 个 bin_centers
+    - encode 用 digitize 逻辑 → 返回 [1, 256]
+    - decode 用 clip(discretized - 1, 0, 254) → 索引 255 个 bin_centers
     """
 
     def __init__(self, bins: int = 256, min_action: float = -1.0, max_action: float = 1.0) -> None:
-        self.bins = bins
+        self.n_bins = bins
         self.min_action = min_action
         self.max_action = max_action
-        # 在 [min_action, max_action] 上均匀切成 bins 段，需要 bins+1 个边界点。
-        edges = torch.linspace(min_action, max_action, bins + 1)
-        # 每个 bin 的中心值（相邻边界的中点），解码时用它作为该 bin 的代表动作值。
-        self.bin_centers = (edges[:-1] + edges[1:]) / 2.0
+
+        # 官方: np.linspace(-1, 1, 256) → 256 个边界点（不是 257！）
+        self.bins = torch.linspace(min_action, max_action, bins)
+
+        # 官方: 256 个边界 → 255 个 bin 中心（相邻边界的中点）
+        self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0  # 255 个值
 
     def encode(self, actions: torch.Tensor) -> torch.Tensor:
-        """把 [-1, 1] 区间的连续动作映射成整数 bin 索引。
+        """连续动作 [-1,1] → bin 索引 [1, n_bins]。
 
-        Args:
-            actions: 形状 [batch, action_dim] 的浮点张量。
+        与官方 np.digitize 一致：返回值范围是 [1, n_bins]（1-indexed），
+        不是 [0, n_bins-1]。这是 np.digitize 的语义：返回第一个大于 action
+        的边界索引。
 
-        Returns:
-            形状 [batch, action_dim] 的 long 张量，取值范围 [0, bins - 1]。
+        官方代码 (action_tokenizer.py:41):
+            discretized_action = np.digitize(action, self.bins)
         """
+        actions = actions.clamp(self.min_action, self.max_action)
 
-        actions = actions.clamp(self.min_action, self.max_action)  # 先裁剪到合法区间，防止越界。
-        # 线性归一化到 [0, 1]。
-        scaled = (actions - self.min_action) / (self.max_action - self.min_action)
-        # 乘以 bins 并取整得到 bin 索引；再 clamp 一次，避免 action==max 时算出 bins（越界）。
-        return torch.clamp((scaled * self.bins).long(), min=0, max=self.bins - 1)
+        # 复刻 np.digitize: 找到第一个 >= action 的 bin 边界索引
+        # np.digitize(action, bins) 返回 i，使得 bins[i-1] <= action < bins[i]
+        # 结果范围: [1, len(bins)] = [1, 256]
+        # 注意: right=True 才能匹配 np.digitize 在边界 (action==±1.0) 的行为
+        discretized = torch.bucketize(actions, self.bins, right=True)
+        return discretized.clamp(1, self.n_bins)  # 确保在 [1, 256] 范围内
 
     def decode(self, action_bins: torch.Tensor) -> torch.Tensor:
-        """把整数 bin 索引还原成归一化的连续动作（取该 bin 的中心值）。"""
+        """bin 索引 [1, 256] → 归一化连续动作。
 
-        centers = self.bin_centers.to(action_bins.device)  # 对齐设备，避免 CPU/GPU 张量混用报错。
-        return centers[action_bins]  # 用高级索引一次性查出每个 bin 对应的中心值。
+        与官方 decode_token_ids_to_actions 一致 (action_tokenizer.py:65-68)：
+            discretized = clip(discretized - 1, 0, 254)  # [1,256] → [0,254]
+            return bin_centers[discretized]               # 255 个中心点
+        """
+        
+        centers = self.bin_centers.to(action_bins.device)
+        
+        # [1, 256] → [0, 255] → clip 到 [0, 254]（因为只有 255 个 bin_centers）
+        idx = (action_bins - 1).clamp(0, self.bin_centers.shape[0] - 1)
+        return centers[idx]
 
     @staticmethod
     def unnormalize(normalized_actions: torch.Tensor, q01: torch.Tensor, q99: torch.Tensor) -> torch.Tensor:
         """把归一化到 [-1, 1] 的动作反归一化回数据集的真实物理尺度。
 
-        这一步对应真实 OpenVLA 用训练数据集的动作分位数统计（q01/q99）来还原动作。
-        本 demo 里 q01=-1、q99=1，所以反归一化实际上是恒等变换。真实机器人上
-        这两个值必须来自对应机器人数据集的动作统计。
+        官方公式 (openvla.py:97-100):
+            actions = 0.5 * (normalized + 1) * (q99 - q01) + q01
         """
-
         q01 = q01.to(normalized_actions.device)
         q99 = q99.to(normalized_actions.device)
-        # 先把 [-1,1] 线性映射到 [0,1]，再拉伸到 [q01, q99] 区间。
         return 0.5 * (normalized_actions + 1.0) * (q99 - q01) + q01
 
 
@@ -154,9 +170,11 @@ class ResidualBlock(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
         super().__init__()
+        
         # 第一层卷积负责改变通道数/下采样（由 stride 控制），bias=False 因为后面接 BN。
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
+        
         # 第二层卷积保持尺寸不变，进一步提取特征。
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
@@ -178,100 +196,190 @@ class ResidualBlock(nn.Module):
 
 
 class TinyResNet16Backbone(nn.Module):
-    """Small ResNet-like image encoder used to replace OpenVLA's real vision stack.
+    """Small ResNet-like image encoder that outputs patch tokens (not a single vector).
 
-    There is no widely used torchvision `resnet16` model, so this file implements
-    a ResNet-16-like backbone for teaching: 8 residual blocks x 2 conv layers =
-    16 residual conv layers. It outputs one fixed-size feature vector per image.
+    复刻官方 DINOv2+SigLIP 的核心思想：保留空间位置信息，输出多个 patch token，
+    而非压缩成单个全局向量。官方输出 256 个 patch（每个 4096 维），这里简化为
+    16 个 patch（4×4 网格，每个 vision_dim 维）。
+
+    结构: 8 residual blocks × 2 conv = 16 层 → AdaptiveAvgPool2d(4,4) → 16 个 patch。
     """
 
-    def __init__(self, output_dim: int) -> None:
+    def __init__(self, output_dim: int, n_patches: int = 16) -> None:
         super().__init__()
-        # stem：入口卷积，把 3 通道 RGB 变成 32 通道，同时 stride=2 先做一次下采样。
+        self.n_patches = n_patches
+        # 4×4=16 个 patch，取 sqrt 得到网格边长。
+        self.grid_size = int(n_patches ** 0.5)
+
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
-        # 8 个残差块，每块含 2 层卷积 = 16 层，故称 “ResNet-16-like”。
-        # 通道数按 32 -> 64 -> 128 逐步加深，stride=2 的块负责空间下采样。
         self.blocks = nn.Sequential(
             ResidualBlock(32, 32),
             ResidualBlock(32, 32),
-            ResidualBlock(32, 64, stride=2),    # 下采样并升到 64 通道。
+            ResidualBlock(32, 64, stride=2),
             ResidualBlock(64, 64),
-            ResidualBlock(64, 128, stride=2),   # 下采样并升到 128 通道。
+            ResidualBlock(64, 128, stride=2),
             ResidualBlock(128, 128),
             ResidualBlock(128, 128),
             ResidualBlock(128, 128),
         )
-        # 自适应平均池化到 1x1，把任意空间尺寸压成每通道一个值，得到全局特征。
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        # 线性投影到指定的 output_dim（= vision_dim），便于后续与文本特征拼接。
+        # 关键改动：池化到 grid_size×grid_size 而非 1×1，保留空间位置信息。
+        # 官方 DINOv2+SigLIP 输出 256 个 patch token，这里输出 16 个。
+        self.pool = nn.AdaptiveAvgPool2d((self.grid_size, self.grid_size))
         self.proj = nn.Linear(128, output_dim)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        x = self.stem(images)          # [B,3,H,W] -> [B,32,H/2,W/2]
-        x = self.blocks(x)             # 经残差块提特征并下采样 -> [B,128,h,w]
-        x = self.pool(x).flatten(1)    # 全局池化 -> [B,128,1,1] -> 展平 [B,128]
-        return self.proj(x)            # 投影 -> [B, output_dim]
+        x = self.stem(images)          # [B,3,224,224] -> [B,32,112,112]
+        x = self.blocks(x)             # -> [B,128,28,28]
+        x = self.pool(x)               # -> [B,128,4,4]  (保留 4×4 空间网格)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)  # [B,128,4,4] -> [B,128,16] -> [B,16,128]
+        return self.proj(x)            # [B, n_patches, output_dim]
 
 
 class TinyTextEncoder(nn.Module):
-    """Small language encoder replacing Llama-2 in the teaching model."""
+    """Token embedding + projector, preserving the full token sequence.
 
-    def __init__(self, vocab_size: int, text_dim: int, pad_id: int = 0) -> None:
+    复刻官方 Llama 的 input embedding 层：token ID → embedding → projector 对齐到
+    fusion_dim。不压缩成单个向量，保留每个 token 的独立表示，与视觉 patch token
+    拼接成完整序列后送入 decoder。
+    """
+
+    def __init__(self, vocab_size: int, embed_dim: int, fusion_dim: int, pad_id: int = 0) -> None:
         super().__init__()
-        # 词嵌入：把 token id 映射成 text_dim 维向量。padding_idx 让 <pad> 的嵌入恒为 0 且不参与训练。
-        self.embedding = nn.Embedding(vocab_size, text_dim, padding_idx=pad_id)
-        # 单层 GRU 顺序读入词向量序列，用最后的隐藏状态汇总整句语义。batch_first 表示输入形状为 [B, T, D]。
-        self.gru = nn.GRU(text_dim, text_dim, batch_first=True)
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
+        # projector: 把 embedding 维度对齐到 fusion_dim（对应 Llama 的 input embedding → hidden_size）。
+        self.proj = nn.Linear(embed_dim, fusion_dim)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        embedded = self.embedding(token_ids)   # [B, T] -> [B, T, text_dim]
-        # GRU 返回 (每步输出, 最终隐藏状态)；这里只要最终隐藏状态作为整句表示。
-        _, hidden = self.gru(embedded)
-        return hidden[-1]                      # hidden 形状 [num_layers, B, D]，取最后一层 -> [B, D]
+        embedded = self.embedding(token_ids)   # [B, T] -> [B, T, embed_dim]
+        return self.proj(embedded)             # [B, T, fusion_dim]
 
 
 class ToyOpenVLA(nn.Module):
-    """Minimal VLA model: image + instruction -> action-bin logits."""
+    """Minimal VLA model with autoregressive action token generation.
+
+    复刻真实 OpenVLA 的三个核心机制：
+    1. 动作 token 占据词表尾部（Llama 词表末尾 256 个位置是 action bin）。
+    2. 动作通过自回归逐 token 生成（prefill + decode），而非并行分类。
+    3. token_id → bin 映射：bin = effective_vocab_size - token_id - 1。
+    """
 
     def __init__(self, config: ToyOpenVLAConfig) -> None:
         super().__init__()
         self.config = config
-        self.vision = TinyResNet16Backbone(config.vision_dim)          # 视觉编码器：图像 -> 特征向量。
-        self.text = TinyTextEncoder(config.vocab_size, config.text_dim)  # 文本编码器：指令 -> 特征向量。
-        # 融合模块：把拼接后的图文特征经两层 MLP 融合成联合表示（对应真实模型里 VLM 的作用）。
-        self.fusion = nn.Sequential(
-            nn.Linear(config.vision_dim + config.text_dim, config.fusion_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(config.fusion_dim, config.fusion_dim),
-            nn.ReLU(inplace=True),
-        )
-        # 动作头：一次性输出 action_dim * action_bins 个 logits，等价于对每个动作维做一次 bins 类分类。
-        self.action_head = nn.Linear(config.fusion_dim, config.action_dim * config.action_bins)
-        # 动作离散化/反离散化工具，训练时把连续动作转 bin，推理时把 bin 转回连续动作。
+        self.vision = TinyResNet16Backbone(config.vision_dim, config.vision_patches)
+        self.text = TinyTextEncoder(config.vocab_size, config.text_dim, config.fusion_dim)
+
+        # 视觉 projector：把每个 patch 投影到 fusion_dim（对应官方的 projector MLP）。
+        self.vision_projector = nn.Linear(config.vision_dim, config.fusion_dim)
+
+        # 词表布局（复刻真实 OpenVLA）：
+        #   [0, text_vocab_size) = 文本 token（对应 Llama 的 32000 个文本 token）
+        #   [text_vocab_size, effective_vocab_size) = 动作 token（256 个 bin）
+        self.text_vocab_size = config.vocab_size
+        self.effective_vocab_size = config.vocab_size + config.action_bins
+
+        # token embedding：动作 token 的 embedding（对应 LLM 的 input embedding，文本已由 TinyTextEncoder 处理）。
+        self.token_embedding = nn.Embedding(self.effective_vocab_size, config.fusion_dim)
+
+        # 自回归解码器（对应 LLM 的 transformer 层，这里用单层 GRU 简化）。
+        self.decoder = nn.GRU(config.fusion_dim, config.fusion_dim, batch_first=True)
+
+        # lm_head：映射到完整词表（对应 LLM 的 lm_head，输出包含文本+动作 token 的 logits）。
+        self.lm_head = nn.Linear(config.fusion_dim, self.effective_vocab_size)
+
         self.action_tokenizer = ActionTokenizer(config.action_bins, config.min_action, config.max_action)
 
-    def forward(self, images: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        """返回动作 bin 的 logits，形状 [batch, action_dim, action_bins]。"""
+    def _build_multimodal_sequence(self, images: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        """构建多模态 token 序列（复刻官方 build_multimodal_inputs 的拼接逻辑）。
 
-        image_features = self.vision(images)       # [B, vision_dim]
-        text_features = self.text(token_ids)       # [B, text_dim]
-        # 沿特征维拼接图文特征，再经融合 MLP 得到联合表示。
-        fused = self.fusion(torch.cat([image_features, text_features], dim=-1))
-        logits = self.action_head(fused)           # [B, action_dim * action_bins]
-        # reshape 成 [B, action_dim, action_bins]，最后一维就是每个动作维在各 bin 上的打分。
-        return logits.view(-1, self.config.action_dim, self.config.action_bins)
+        官方顺序 (common.py:117-124):
+            [BOS] + [256 视觉 patch] + [剩余文本 token]
+        Toy 顺序:
+            [第1个文本token] + [16 视觉 patch] + [剩余31个文本token]
+        = [1 + 16 + 31] = 48 个 token，对应官方的 [1 + 256 + 5] = 262 个 token。
+
+        官方用文本序列的第一个 token (BOS) 作为序列起始标记，这里复用同一思路。
+        """
+        # 视觉 patch tokens → projector 对齐到 fusion_dim
+        image_features = self.vision(images)                    # [B, n_patches, vision_dim]
+        projected_patches = self.vision_projector(image_features)  # [B, n_patches, fusion_dim]
+
+        # 文本 token embeddings（已由 TinyTextEncoder 对齐到 fusion_dim）
+        text_embeds = self.text(token_ids)                      # [B, max_text_len, fusion_dim]
+
+        # 拼接: [第1个文本token] + [视觉patch] + [剩余文本token]
+        return torch.cat(
+            [
+                text_embeds[:, :1, :],        # [B, 1, fusion_dim]  - 对应官方 BOS
+                projected_patches,             # [B, 16, fusion_dim] - 对应官方 256 视觉 token
+                text_embeds[:, 1:, :],         # [B, 31, fusion_dim] - 对应官方 5 个文本 token
+            ],
+            dim=1,
+        )  # [B, 48, fusion_dim]
+
+    def _bin_to_token_id(self, bins: torch.Tensor) -> torch.Tensor:
+        """bin 索引 [1,256] → token ID（复刻官方 action_tokenizer.py:45）。
+
+        官方公式: token_id = vocab_size - discretized
+          bins=1   → token_id = effective_vocab_size - 1  (词表最后一个 = 最小动作)
+          bins=256 → token_id = effective_vocab_size - 256 (动作区起始 = 最大动作)
+        """
+        return self.effective_vocab_size - bins
+
+    def _token_id_to_bin(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """token ID → bin 索引 [1,256]（复刻官方 action_tokenizer.py:65）。
+
+        官方公式: discretized = vocab_size - token_id
+        注意：这里返回的是 [1, 256]，decode() 内部会 -1 并 clip 到 [0, 254]。
+        """
+        return (self.effective_vocab_size - token_ids).clamp(1, self.config.action_bins)
+
+    def forward(
+        self, images: torch.Tensor, token_ids: torch.Tensor, target_actions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """训练前向：teacher-forcing 的 next-token 预测。
+
+        Prefill:  构建多模态序列 [BOS]+[视觉]+[文本] → GRU → 最终 hidden state。
+        Decode:   用 hidden 作为初始状态，teacher-forcing 预测 7 个 action token。
+        """
+        # --- Prefill: 处理多模态序列 ---
+        multimodal_seq = self._build_multimodal_sequence(images, token_ids)  # [B, 48, fusion_dim]
+        prefill_output, hidden = self.decoder(multimodal_seq)  # hidden: [1, B, fusion_dim]
+
+        # --- Decode: teacher-forcing 预测动作 token ---
+        target_bins = self.action_tokenizer.encode(target_actions)    # [B, action_dim]
+        target_token_ids = self._bin_to_token_id(target_bins)         # [B, action_dim]
+
+        target_embeds = self.token_embedding(target_token_ids)  # [B, action_dim, fusion_dim]
+
+        # decoder 输入: 右移一位 (第一个输入用 prefill 最后一步的输出)
+        prefill_last_output = prefill_output[:, -1:, :]  # [B, 1, fusion_dim]
+        decoder_input = torch.cat(
+            [prefill_last_output, target_embeds[:, :-1, :]],
+            dim=1,
+        )  # [B, action_dim, fusion_dim]
+
+        decoder_output, _ = self.decoder(decoder_input, hidden)  # [B, action_dim, fusion_dim]
+        logits = self.lm_head(decoder_output)  # [B, action_dim, effective_vocab_size]
+
+        return logits, target_token_ids
 
     def loss(self, images: torch.Tensor, token_ids: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """动作 bin 的交叉熵损失：把每个动作维当成一次独立的分类任务。"""
+        """Next-token 交叉熵损失（只在动作 token 上计算）。
 
-        logits = self.forward(images, token_ids)              # [B, action_dim, action_bins]
-        target_bins = self.action_tokenizer.encode(actions)   # 连续动作 -> 目标 bin 索引 [B, action_dim]
-        # flatten(0,1) 把前两维合并成 [B*action_dim, ...]，让所有 (样本,动作维) 一起算交叉熵。
-        return F.cross_entropy(logits.flatten(0, 1), target_bins.flatten(0, 1))
+        对应真实 OpenVLA 的训练损失：next-token cross-entropy，
+        模型需要学会在 action token 区间内预测正确的 bin。
+        """
+        logits, target_token_ids = self.forward(images, token_ids, actions)
+        return F.cross_entropy(
+            logits.reshape(-1, self.effective_vocab_size),
+            target_token_ids.reshape(-1),
+        )
 
     @torch.inference_mode()
     def predict_action(
@@ -281,23 +389,37 @@ class ToyOpenVLA(nn.Module):
         q01: torch.Tensor | None = None,
         q99: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict a continuous 7-DoF action.
+        """自回归动作生成（复刻真实 OpenVLA 的 prefill + decode 流程）。
 
-        Args:
-            images: [batch, 3, H, W] float tensor in [0, 1].
-            token_ids: [batch, max_text_len] instruction token ids.
-            q01/q99: Optional per-action-dim statistics for unnormalization.
-
-        Returns:
-            [batch, action_dim] continuous action tensor.
+        Prefill:  [BOS]+[视觉patch]+[文本] 序列 → GRU → hidden state（汇总全部上下文）。
+        Decode:   hidden → lm_head → 生成第 1 个 action token → embedding → GRU → 第 2 个 → ...
+                  每步的 GRU hidden state 携带历史信息，实现维度间依赖。
         """
+        # --- Prefill: 处理多模态序列，得到初始 hidden state ---
+        multimodal_seq = self._build_multimodal_sequence(images, token_ids)  # [B, 48, fusion_dim]
+        prefill_output, hidden = self.decoder(multimodal_seq)  # hidden: [1, B, fusion_dim]
 
-        logits = self.forward(images, token_ids)                    # [B, action_dim, action_bins]
-        pred_bins = logits.argmax(dim=-1)                            # 每个动作维取分数最高的 bin（贪心解码）。
-        normalized_actions = self.action_tokenizer.decode(pred_bins)  # bin 索引 -> 归一化连续动作。
+        # decode 的首步输入 = prefill 最后一步的输出
+        decoder_input = prefill_output[:, -1:, :]  # [B, 1, fusion_dim]
+
+        generated_token_ids: list[torch.Tensor] = []
+
+        for step in range(self.config.action_dim):
+            decoder_output, hidden = self.decoder(decoder_input, hidden)  # [B, 1, fusion_dim]
+            logits = self.lm_head(decoder_output[:, -1, :])  # [B, effective_vocab_size]
+
+            next_token_id = logits.argmax(dim=-1)  # [B]  贪心解码
+            generated_token_ids.append(next_token_id)
+
+            decoder_input = self.token_embedding(next_token_id).unsqueeze(1)  # [B, 1, fusion_dim]
+
+        # token ID → bin → 连续动作
+        token_ids_tensor = torch.stack(generated_token_ids, dim=1)  # [B, action_dim]
+        bins = self._token_id_to_bin(token_ids_tensor)
+        normalized_actions = self.action_tokenizer.decode(bins)
+
         if q01 is None or q99 is None:
-            return normalized_actions                               # 未提供统计量时直接返回归一化动作。
-        # 提供了数据集统计量时，反归一化到真实物理尺度。
+            return normalized_actions
         return self.action_tokenizer.unnormalize(normalized_actions, q01, q99)
 
 
@@ -331,9 +453,11 @@ class SyntheticRobotDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tens
         return self.length
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
         # 用 index 作为随机种子，保证同一 index 每次取到完全相同的样本（可复现）。
         generator = torch.Generator().manual_seed(index)
         image = torch.rand(3, self.config.image_size, self.config.image_size, generator=generator)
+        
         # 指令在固定列表里循环选取。
         instruction = self.instructions[index % len(self.instructions)]
         token_ids = self.tokenizer.encode(openvla_prompt(instruction))  # 套上 OpenVLA prompt 模板再编码。
@@ -354,26 +478,32 @@ class SyntheticRobotDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tens
             ],
             dtype=torch.float32,
         )
-        # 返回 (图像, 指令 token, 归一化动作)，动作再裁剪一次确保落在 [-1,1]。
+        
+        # 返回 (图像, 指令 token, 归一化动作)，动作再裁剪一次确保落在 [-1,1]
         return image, token_ids, base.clamp(-1.0, 1.0)
 
 
 def openvla_prompt(instruction: str) -> str:
+    
     # 复刻 OpenVLA 的 prompt 模板，把裸指令包装成模型期望的问答格式。
     return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
 
 
 def load_image_tensor(path: str, image_size: int) -> torch.Tensor:
+    
     # 读图 -> 转 RGB -> resize 成正方形。
     image = Image.open(path).convert("RGB").resize((image_size, image_size))
+    
     # 把 PIL 原始字节读进 ByteTensor（形状暂时是一维）。
     data = torch.ByteTensor(torch.ByteStorage.from_buffer(image.tobytes()))
+    
     # reshape 成 [H, W, 3]，再调整成 PyTorch 期望的 [3, H, W]，并归一化到 [0,1]。
     data = data.view(image_size, image_size, 3).permute(2, 0, 1).float() / 255.0
     return data
 
 
 def train_demo(model: ToyOpenVLA, dataset: SyntheticRobotDataset, steps: int, batch_size: int) -> None:
+    
     # DataLoader 负责成批取样并打乱顺序。
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)  # AdamW 优化器。
@@ -391,8 +521,10 @@ def train_demo(model: ToyOpenVLA, dataset: SyntheticRobotDataset, steps: int, ba
 def run_prediction_demo(model: ToyOpenVLA, tokenizer: SimpleTokenizer, image: torch.Tensor, instruction: str) -> None:
     model.eval()  # 切到推理模式（关闭 dropout、用 BN 的运行统计）。
     prompt = openvla_prompt(instruction)
+    
     # 编码后用 unsqueeze(0) 加上 batch 维，凑成 [1, max_text_len]。
     token_ids = tokenizer.encode(prompt).unsqueeze(0)
+    
     # 图像同样加 batch 维成 [1,3,H,W]，预测一个 7 维动作。
     action = model.predict_action(image.unsqueeze(0), token_ids)
     print("prompt:", prompt)
@@ -409,6 +541,7 @@ def main() -> None:
 
     config = ToyOpenVLAConfig()
     tokenizer = SimpleTokenizer(max_len=config.max_text_len)
+    
     # 用数据集里所有指令（套过 prompt 模板）来构建词表。
     tokenizer.build_vocab((openvla_prompt(text) for text in SyntheticRobotDataset.instructions), config.vocab_size)
 

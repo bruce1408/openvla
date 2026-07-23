@@ -189,7 +189,7 @@ def main() -> None:
     parser.add_argument("--glob", default="*.jpg")
     parser.add_argument("--instruction", default="pick up the object")
     parser.add_argument("--limit", type=int, default=0, help="0 = all")
-    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
