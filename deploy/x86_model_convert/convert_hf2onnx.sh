@@ -6,7 +6,8 @@
 #   ./convert_hf_onnx.sh bf16         # 同上
 #   ./convert_hf_onnx.sh fp8          # FP8 量化 + 导出
 #   ./convert_hf_onnx.sh nvfp4        # NVFP4 量化 + 导出
-#   ./convert_hf_onnx.sh all          # bf16 + fp8 + nvfp4 全部
+#   ./convert_hf_onnx.sh mxfp8        # MXFP8 量化 + 导出
+#   ./convert_hf_onnx.sh all          # bf16 + fp8 + nvfp4 + mxfp8 全部
 #   FORCE=1 ./convert_hf_onnx.sh fp8  # 覆盖已有产物重新执行
 #
 # 注意:
@@ -109,6 +110,11 @@ stage_nvfp4() {
     do_export "${OUT_BASE}/hf_llama_nvfp4" "${OUT_BASE}/hf_llama_onnx_nvfp4" edgellm_export_nvfp4.log
 }
 
+stage_mxfp8() {
+    do_quantize mxfp8 "${OUT_BASE}/hf_llama_mxfp8" edgellm_quantize_mxfp8.log
+    do_export "${OUT_BASE}/hf_llama_mxfp8" "${OUT_BASE}/hf_llama_onnx_mxfp8" edgellm_export_mxfp8.log
+}
+
 # ---------------- 入口 ----------------
 STAGE="${1:-bf16}"
 [[ -d "${MODEL_DIR}" ]] || { echo "模型目录不存在: ${MODEL_DIR}" >&2; exit 1; }
@@ -117,8 +123,9 @@ case "${STAGE}" in
     bf16)  stage_bf16 ;;
     fp8)   stage_fp8 ;;
     nvfp4) stage_nvfp4 ;;
-    all)   stage_bf16; stage_fp8; stage_nvfp4 ;;
-    *) echo "未知阶段: ${STAGE}（可选: bf16 | fp8 | nvfp4 | all）" >&2; exit 2 ;;
+    mxfp8) stage_mxfp8 ;;
+    all)   stage_bf16; stage_fp8; stage_nvfp4; stage_mxfp8 ;;
+    *) echo "未知阶段: ${STAGE}（可选: bf16 | fp8 | nvfp4 | mxfp8 | all）" >&2; exit 2 ;;
 esac
 
 log "全部完成 (${STAGE})"
