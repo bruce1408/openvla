@@ -123,21 +123,28 @@ class ActionTokenizer:
     def encode(self, actions: torch.Tensor) -> torch.Tensor:
         """连续动作 [-1,1] → bin 索引 [1, n_bins]。
 
-        与官方 np.digitize 一致：返回值范围是 [1, n_bins]（1-indexed），
-        不是 [0, n_bins-1]。这是 np.digitize 的语义：返回第一个大于 action
-        的边界索引。
+        与官方 np.digitize 一致：返回值范围是 [1, n_bins]（1-indexed）。
 
         官方代码 (action_tokenizer.py:41):
             discretized_action = np.digitize(action, self.bins)
         """
         actions = actions.clamp(self.min_action, self.max_action)
 
-        # 复刻 np.digitize: 找到第一个 >= action 的 bin 边界索引
-        # np.digitize(action, bins) 返回 i，使得 bins[i-1] <= action < bins[i]
-        # 结果范围: [1, len(bins)] = [1, 256]
-        # 注意: right=True 才能匹配 np.digitize 在边界 (action==±1.0) 的行为
-        discretized = torch.bucketize(actions, self.bins, right=True)
-        return discretized.clamp(1, self.n_bins)  # 确保在 [1, 256] 范围内
+        # 逐步计算 bin 索引，逻辑等价于 np.digitize(action, bins)，但展开为显式循环更易读。
+        # np.digitize 语义：找到第一个 bins[i] > action 的位置 i，即 bins[i-1] <= action < bins[i]。
+        # 对每个 action 值，从第 1 个 bin 边界开始往后比较，直到找到严格大于 action 的边界。
+        bin_edges = self.bins.to(actions.device)              # [n_bins] 个边界点
+        orig_shape = actions.shape # [8, 7]
+        flat_actions = actions.flatten()                        # [N]
+
+        # 对每个 action，统计有多少个 bin 边界 <= action，即为该 action 的 bin 索引。
+        # sum(bins <= action) 的结果范围是 [0, n_bins]，+1 对齐 digitize 的 [1, n_bins]。
+        # 但 digitize 用的是 bins > action（严格大于），所以用 (bin_edges <= a).sum() 再 +1。
+        discretized = torch.empty_like(flat_actions, dtype=torch.long)
+        for i, a in enumerate(flat_actions):
+            discretized[i] = (bin_edges <= a).sum().clamp(1, self.n_bins)
+
+        return discretized.reshape(orig_shape)
 
     def decode(self, action_bins: torch.Tensor) -> torch.Tensor:
         """bin 索引 [1, 256] → 归一化连续动作。
@@ -349,20 +356,22 @@ class ToyOpenVLA(nn.Module):
         """
         # --- Prefill: 处理多模态序列 ---
         multimodal_seq = self._build_multimodal_sequence(images, token_ids)  # [B, 48, fusion_dim]
-        prefill_output, hidden = self.decoder(multimodal_seq)  # hidden: [1, B, fusion_dim]
+        prefill_output, hidden = self.decoder(multimodal_seq)  # prefill_output [8, 12 + 36, 256], hidden: [1, B, fusion_dim]
 
         # --- Decode: teacher-forcing 预测动作 token ---
         target_bins = self.action_tokenizer.encode(target_actions)    # [B, action_dim]
         target_token_ids = self._bin_to_token_id(target_bins)         # [B, action_dim]
-
+        # 例如目标动作 [0.5, -0.3, ...] → bins [193, 90, ...] → token_ids [191, 294, ...] → 7 个 256 维向量。
         target_embeds = self.token_embedding(target_token_ids)  # [B, action_dim, fusion_dim]
 
         # decoder 输入: 右移一位 (第一个输入用 prefill 最后一步的输出)
         prefill_last_output = prefill_output[:, -1:, :]  # [B, 1, fusion_dim]
+        
+        # [B, action_dim, fusion_dim] = [8, 7, 256]
         decoder_input = torch.cat(
             [prefill_last_output, target_embeds[:, :-1, :]],
             dim=1,
-        )  # [B, action_dim, fusion_dim]
+        )
 
         decoder_output, _ = self.decoder(decoder_input, hidden)  # [B, action_dim, fusion_dim]
         logits = self.lm_head(decoder_output)  # [B, action_dim, effective_vocab_size]
