@@ -366,6 +366,95 @@ def profile_llm_layers(engine_dir: Path, action_dim: int, warmup: int, output_di
 
 
 # ---------------------------------------------------------------------------
+# 逐层精度验证 (engine inspector) —— 回答"fp8/nvfp4 是否真的生效、哪些层 fallback"
+# ---------------------------------------------------------------------------
+
+# 量化数据类型关键字 (小写匹配 Format/Datatype 字段)
+_QUANT_DTYPES = ("fp8", "int8", "fp4", "nvfp4")
+
+
+def verify_engine_precision(engine_path: Path, plugin_path: Path | None = None) -> dict:
+    """用 TensorRT engine inspector 导出逐层精度 (输出 Format/Datatype),验证量化是否落地。
+
+    torch.profiler / llm_bench 都拿不到"每层实际运行精度",无法判断 fp8 是否真的
+    生效、还是悄悄 fallback 回 fp16。engine inspector 直接从引擎读到每层输入/输出的
+    datatype,是量化验证的权威来源。
+
+    前提: engine 必须在 build 时开 --profilingVerbosity=detailed;否则 inspector 只
+    返回层名字符串 (names-only),此时返回 detailed=False 提示需重建。
+    """
+    import collections
+    import ctypes
+
+    import tensorrt as trt
+
+    logger = trt.Logger(trt.Logger.ERROR)
+    if plugin_path and Path(plugin_path).exists():
+        ctypes.CDLL(str(plugin_path))  # Edge-LLM engine 需先加载自定义 plugin 才能反序列化
+    trt.init_libnvinfer_plugins(logger, "")
+
+    with open(engine_path, "rb") as f, trt.Runtime(logger) as runtime:
+        engine = runtime.deserialize_cuda_engine(f.read())
+    info = json.loads(engine.create_engine_inspector().get_engine_information(trt.LayerInformationFormat.JSON))
+    layers = info.get("Layers", []) if isinstance(info, dict) else info
+
+    # names-only: detailed verbosity 没开,inspector 只给字符串层名
+    dict_layers = [L for L in layers if isinstance(L, dict)]
+    if not dict_layers:
+        return {
+            "engine": str(engine_path),
+            "detailed": False,
+            "num_layers": len(layers),
+            "note": "engine 未用 --profilingVerbosity=detailed 构建 (inspector 仅返回层名),无法验证逐层精度;需重建 engine。",
+        }
+
+    def is_quant(dt: str) -> bool:
+        d = dt.lower()
+        return any(q in d for q in _QUANT_DTYPES)
+
+    out_dt: dict[str, int] = collections.Counter()
+    in_dt: dict[str, int] = collections.Counter()
+    fallback_layers = []  # 输出全非量化 (纯 Half/Float) 的层 —— 量化引擎里的 fallback 嫌疑
+    for L in dict_layers:
+        outs = L.get("Outputs") or []
+        for o in outs:
+            out_dt[o.get("Format/Datatype", "?")] += 1
+        for i in (L.get("Inputs") or []):
+            in_dt[i.get("Format/Datatype", "?")] += 1
+        if outs and not any(is_quant(o.get("Format/Datatype", "")) for o in outs):
+            fallback_layers.append(L.get("Name", "")[:70])
+
+    total_out = sum(out_dt.values())
+    quant_out = sum(v for k, v in out_dt.items() if is_quant(k))
+    quant_pct = round(quant_out / total_out * 100, 1) if total_out else 0.0
+
+    return {
+        "engine": str(engine_path),
+        "detailed": True,
+        "num_layers": len(dict_layers),
+        "output_dtype_histogram": dict(out_dt),
+        "input_dtype_histogram": dict(in_dt),
+        "quantized_output_pct": quant_pct,
+        "fallback_layer_count": len(fallback_layers),
+        "fallback_layers_sample": fallback_layers[:10],
+    }
+
+
+def print_precision_report(title: str, rep: dict) -> None:
+    """把 verify_engine_precision 的结果打印成人类可读的小表。"""
+    print(f"\n  --- 逐层精度验证: {title} ---")
+    if not rep.get("detailed"):
+        print(f"    [!] {rep.get('note')}")
+        return
+    print(f"    层数: {rep['num_layers']}  |  量化输出占比: {rep['quantized_output_pct']:.1f}%")
+    print(f"    输出 datatype 分布: {rep['output_dtype_histogram']}")
+    if rep["fallback_layer_count"]:
+        print(f"    非量化(fallback)层: {rep['fallback_layer_count']} 个,例如:")
+        for n in rep["fallback_layers_sample"][:5]:
+            print(f"      - {n}")
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
@@ -377,9 +466,11 @@ def main() -> None:
     parser.add_argument("--action-dim", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=3, help="profiler warmup steps (vision) / llm_inference warmup")
     parser.add_argument("--active", type=int, default=10, help="recorded steps (vision) / llm requests")
-    parser.add_argument("--vision-engine", default=str(ARTIFACTS / "engines/vision_projector_fp16.plan"))
+    parser.add_argument("--vision-engine", default=str(ARTIFACTS / "engines/vision_projector_fp8.plan"))
     parser.add_argument("--skip-vision", action="store_true", help="跳过 vision profiling")
     parser.add_argument("--skip-llm", action="store_true", help="跳过 LLM profiling")
+    parser.add_argument("--verify-precision", action="store_true",
+                        help="用 engine inspector 导出逐层精度,验证 fp8/nvfp4 是否真的生效")
     parser.add_argument("--output-dir", default=None, help="trace 产物输出目录")
     parser.add_argument("--tag", default=None, help="文件名标签 (默认时间戳)")
     args = parser.parse_args()
@@ -451,6 +542,22 @@ def main() -> None:
             print(f"  top-3 耗时层:")
             for it in lb["top10_layers"][:3]:
                 print(f"    {it['layer'][:50]:50s}  {it['time_ms']:.4f} ms  [{it['category']}]")
+
+    # --- 逐层精度验证 (可选) ---
+    if args.verify_precision:
+        print(f"\n>>> 逐层精度验证 (engine inspector)...")
+        prec_report = {}
+        if not args.skip_vision:
+            rep = verify_engine_precision(vision_engine)
+            prec_report["vision"] = rep
+            print_precision_report(f"vision [{vision_precision}]", rep)
+        if not args.skip_llm:
+            llm_engine_file = llm_engine_dir / "llm.engine"
+            plugin = EDGE_LLM_DIR / "build/libNvInfer_edgellm_plugin.so"
+            rep = verify_engine_precision(llm_engine_file, plugin_path=plugin)
+            prec_report["llm"] = rep
+            print_precision_report(f"LLM [{llm_precision}]", rep)
+        result["precision_verification"] = prec_report
 
     # --- 汇总 ---
     print("\n" + "=" * 64)
