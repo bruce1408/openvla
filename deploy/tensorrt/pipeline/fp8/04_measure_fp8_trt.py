@@ -29,7 +29,7 @@ from typing import Any
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[4]
 EDGE_LLM_DIR = Path(os.environ.get("EDGE_LLM_DIR", "/workspace/TensorRT-Edge-LLM"))
 ARTIFACTS = REPO / "deploy/tensorrt/artifacts"
 VISION_ENGINE = ARTIFACTS / "engines/vision_projector_fp8.plan"

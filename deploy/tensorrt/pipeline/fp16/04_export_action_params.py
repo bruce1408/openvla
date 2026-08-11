@@ -7,14 +7,15 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
-from transformers import AutoConfig
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
 
+from runtime_env import MODEL_PATH, MODEL_REVISION  # noqa: E402 (must precede transformers)
+
+import numpy as np  # noqa: E402
+from transformers import AutoConfig  # noqa: E402
+
 from deploy.tensorrt.common import DEFAULT_UNNORM_KEY, EMPTY_TOKEN_ID, write_json  # noqa: E402
-from runtime_env import MODEL_PATH, MODEL_REVISION  # noqa: E402
 
 
 def main() -> None:
@@ -43,6 +44,8 @@ def main() -> None:
     bin_centers = (bins[:-1] + bins[1:]) / 2.0
     action_dim = len(stats["q01"])
     value = {
+        "source_model": MODEL_PATH,
+        "source_revision": MODEL_REVISION,
         "unnorm_key": args.unnorm_key,
         "empty_token_id": EMPTY_TOKEN_ID,
         "action_dim": action_dim,

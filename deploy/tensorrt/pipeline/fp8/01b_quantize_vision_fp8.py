@@ -25,7 +25,7 @@
 #   artifacts/onnx/vision_projector_fp8.manifest.json         量化元数据
 #
 # 之后构建 FP8 engine:
-#   bash 05_build_vision_engine.sh \
+#   bash deploy/tensorrt/pipeline/fp16/05_build_vision_engine.sh \
 #       artifacts/onnx/vision_projector_fp8.onnx \
 #       artifacts/engines/vision_projector_fp8.plan
 #   (05 需带 --fp8;见脚本末尾提示)
@@ -39,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
 
 # 必须在 transformers 之前(runtime_env 会设好 HF 缓存路径)
@@ -117,7 +117,7 @@ def main() -> None:
 
     if not args.input_onnx.exists():
         raise SystemExit(
-            f"找不到输入 ONNX: {args.input_onnx}\n请先运行 01_export_vision_projector_onnx.py"
+            f"找不到输入 ONNX: {args.input_onnx}\n请先运行 deploy/tensorrt/pipeline/fp16/01_export_vision_projector_onnx.py"
         )
 
     # 收集校准图片
@@ -159,7 +159,7 @@ def main() -> None:
     print(manifest)
     print("\n下一步 (构建 FP8 engine):")
     print(
-        "  bash 05_build_vision_engine.sh \\\n"
+        "  bash deploy/tensorrt/pipeline/fp16/05_build_vision_engine.sh \\\n"
         f"      {args.output_onnx} \\\n"
         f"      {ARTIFACTS}/engines/vision_projector_fp8.plan"
     )

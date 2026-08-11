@@ -45,8 +45,10 @@ from pathlib import Path
 
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
+
+from deploy.tensorrt.runtime.edge_llm_runner import EdgeLlmRunner  # noqa: E402
 
 EDGE_LLM_DIR = Path(os.environ.get("EDGE_LLM_DIR", "/workspace/TensorRT-Edge-LLM"))
 ARTIFACTS = REPO_ROOT / "deploy/tensorrt/artifacts"
@@ -205,8 +207,8 @@ def main() -> None:
 
     import torch
 
-    engine = Fp8LlmEngine(LLM_ENGINE_DIR / "llm.engine", args.device)
-    emb_tbl = load_embedding_table(args.device)
+    engine = EdgeLlmRunner(LLM_ENGINE_DIR, PLUGIN, args.device)
+    emb_tbl = engine.load_embedding_table()
 
     result: dict = {"mode": args.mode, "engine": str(LLM_ENGINE_DIR / "llm.engine")}
 

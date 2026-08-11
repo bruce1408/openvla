@@ -1,0 +1,172 @@
+"""Measure the REAL achievable bf16 peak compute (TFLOPS) and memory bandwidth
+(GB/s) of this GPU, so the roofline in the profiling report can be calibrated
+against measured hardware limits instead of datasheet guesses.
+
+Compute peak  : large square GEMMs, FLOP = 2*M*N*K per matmul.
+Bandwidth peak: a large device-to-device copy, bytes = 2 * tensor_bytes
+                (one read + one write).
+
+Jetson note: for a true peak, first pin clocks to max:
+    sudo nvpmodel -m 0      # MAXN power mode
+    sudo jetson_clocks      # lock GPU/EMC clocks to max
+Otherwise DVFS will report a number below the hardware ceiling.
+"""
+
+import argparse
+import os
+import time
+
+import torch
+
+
+def sync() -> None:
+    torch.cuda.synchronize()
+
+
+def time_ms(fn, iters: int, warmup: int) -> float:
+    """Median-free mean wall time (ms) of `fn` over `iters`, after `warmup`."""
+    for _ in range(warmup):
+        fn()
+    sync()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    sync()
+    return start.elapsed_time(end) / iters
+
+
+def bench_gemm(dtype: torch.dtype, device: str, iters: int, warmup: int) -> None:
+    print(f"\n=== GEMM peak ({str(dtype).replace('torch.', '')}) ===")
+    print(f"{'M=N=K':>7} {'ms/iter':>10} {'TFLOPS':>10}")
+    best = 0.0
+    for n in (1024, 2048, 4096, 8192, 12288, 16384):
+        try:
+            a = torch.randn(n, n, device=device, dtype=dtype)
+            b = torch.randn(n, n, device=device, dtype=dtype)
+            c = torch.empty(n, n, device=device, dtype=dtype)
+        except RuntimeError as exc:  # OOM on the largest sizes
+            print(f"{n:>7}   skipped ({type(exc).__name__})")
+            continue
+
+        def step() -> None:
+            torch.mm(a, b, out=c)
+
+        ms = time_ms(step, iters, warmup)
+        flops = 2.0 * n * n * n
+        tflops = flops / (ms * 1e-3) / 1e12
+        best = max(best, tflops)
+        print(f"{n:>7} {ms:>10.3f} {tflops:>10.1f}")
+        del a, b, c
+        torch.cuda.empty_cache()
+    print(f"--> measured bf16 peak (dense): {best:.1f} TFLOPS")
+
+
+def bench_gemm_sustained(dtype: torch.dtype, device: str, size: int, seconds: float, warmup: int) -> None:
+    """Hold one large GEMM under sustained load and watch it settle.
+
+    A real inference workload runs the GPU flat-out for many ms at a time, so the
+    honest roofline denominator is the throttled steady-state TFLOPS, not the
+    short-kernel boost peak. This runs the same GEMM for `seconds` and prints the
+    TFLOPS of each ~fixed-work window, so you can see boost -> steady-state.
+    """
+    print(f"\n=== GEMM sustained ({str(dtype).replace('torch.', '')}, M=N=K={size}, ~{seconds:.0f}s) ===")
+    try:
+        a = torch.randn(size, size, device=device, dtype=dtype)
+        b = torch.randn(size, size, device=device, dtype=dtype)
+        c = torch.empty(size, size, device=device, dtype=dtype)
+    except RuntimeError as exc:
+        print(f"  skipped ({type(exc).__name__}) — try a smaller --sustained-size")
+        return
+
+    def step() -> None:
+        torch.mm(a, b, out=c)
+
+    for _ in range(warmup):
+        step()
+    sync()
+
+    flops = 2.0 * size * size * size
+    window_iters = 20
+    print(f"{'t(s)':>6} {'TFLOPS':>10}")
+    boost = 0.0
+    last = 0.0
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < seconds:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(window_iters):
+            step()
+        end.record()
+        sync()
+        tflops = flops / (start.elapsed_time(end) / window_iters * 1e-3) / 1e12
+        boost = max(boost, tflops)
+        last = tflops
+        print(f"{time.perf_counter() - t0:>6.1f} {tflops:>10.1f}")
+
+    drop = (1.0 - last / boost) * 100.0 if boost else 0.0
+    print(f"--> burst (best window):      {boost:.1f} TFLOPS")
+    print(f"--> sustained (last window):  {last:.1f} TFLOPS  (throttled {drop:.0f}% below burst)")
+    print("    Use the SUSTAINED value as the roofline denominator for a real workload.")
+    del a, b, c
+    torch.cuda.empty_cache()
+
+
+def bench_bandwidth(device: str, iters: int, warmup: int) -> None:
+    print("\n=== Memory bandwidth (device-to-device copy) ===")
+    print(f"{'bytes(MB)':>10} {'ms/iter':>10} {'GB/s':>10}")
+    best = 0.0
+    for mb in (256, 512, 1024, 2048):
+        n = (mb * 1024 * 1024) // 2  # bf16 = 2 bytes/elem
+        src = torch.randn(n, device=device, dtype=torch.bfloat16)
+        dst = torch.empty_like(src)
+
+        def step() -> None:
+            dst.copy_(src)
+
+        ms = time_ms(step, iters, warmup)
+        moved = 2.0 * src.numel() * src.element_size()  # read + write
+        gbps = moved / (ms * 1e-3) / 1e9
+        best = max(best, gbps)
+        print(f"{mb:>10} {ms:>10.3f} {gbps:>10.1f}")
+        del src, dst
+        torch.cuda.empty_cache()
+    print(f"--> measured peak bandwidth: {best:.1f} GB/s")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Measure real bf16 peak TFLOPS and bandwidth.")
+    p.add_argument("--device", default=os.getenv("OPENVLA_DEVICE", "cuda:0"))
+    p.add_argument("--iters", type=int, default=50)
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
+    p.add_argument("--sustained-seconds", type=float, default=15.0, help="hold a large GEMM this long to read steady-state TFLOPS; 0 to skip")
+    p.add_argument("--sustained-size", type=int, default=8192, help="M=N=K for the sustained-load GEMM")
+    args = p.parse_args()
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA not available")
+
+    torch.backends.cuda.matmul.allow_tf32 = False  # measure true bf16, not tf32
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+
+    print("gpu:", torch.cuda.get_device_name(0))
+    print("capability:", torch.cuda.get_device_capability(0))
+    print("torch:", torch.__version__, "| cuda:", torch.version.cuda)
+    print("device:", args.device, "| iters:", args.iters, "| warmup:", args.warmup)
+
+    bench_gemm(dtype, args.device, args.iters, args.warmup)
+    if args.sustained_seconds > 0:
+        bench_gemm_sustained(dtype, args.device, args.sustained_size, args.sustained_seconds, args.warmup)
+    bench_bandwidth(args.device, args.iters, args.warmup)
+
+    print("\nRoofline ridge point = peak_TFLOPS*1e12 / peak_GBps*1e9  (FLOP/byte)")
+    print("Compare your workload's arithmetic intensity against this ridge:")
+    print("  AI < ridge  -> memory-bound;  AI > ridge -> compute-bound")
+
+
+if __name__ == "__main__":
+    main()

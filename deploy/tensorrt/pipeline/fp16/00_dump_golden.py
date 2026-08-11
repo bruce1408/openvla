@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
 
 from deploy.tensorrt.common import (  # noqa: E402

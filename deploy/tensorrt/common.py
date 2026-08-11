@@ -20,6 +20,48 @@ from transformers import AutoModelForVision2Seq, AutoProcessor
 EMPTY_TOKEN_ID = 29871
 DEFAULT_INSTRUCTION = "pick up the blue object"
 DEFAULT_UNNORM_KEY = "bridge_orig"
+ACTION_META_PATH = Path(__file__).resolve().parent / "artifacts/action_meta/action_meta.json"
+
+
+def load_action_meta(path: Path | str | None = None) -> dict[str, Any]:
+    """Load exported action detokenization sidecar (04_export_action_params.py)."""
+
+    meta_path = Path(path) if path is not None else ACTION_META_PATH
+    return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def action_token_bounds_from_meta(meta: dict[str, Any] | None = None) -> tuple[int, int]:
+    """Inclusive action-token ID range from the sidecar."""
+
+    meta = meta or load_action_meta()
+    return int(meta["action_token_id_min"]), int(meta["action_token_id_max"])
+
+
+def decode_action_tokens_from_meta(
+    token_ids: np.ndarray,
+    meta: dict[str, Any] | None = None,
+    unnorm_key: str = DEFAULT_UNNORM_KEY,
+) -> np.ndarray:
+    """Decode action tokens via action_meta.json (no bf16 model required)."""
+
+    meta = meta or load_action_meta()
+    if meta.get("unnorm_key") != unnorm_key:
+        raise ValueError(
+            f"action_meta unnorm_key={meta.get('unnorm_key')!r} != requested {unnorm_key!r}"
+        )
+
+    token_ids = np.asarray(token_ids, dtype=np.int64)
+    vocab_size = int(meta["effective_vocab_size"])
+    bin_centers = np.asarray(meta["bin_centers"], dtype=np.float64)
+    low = np.asarray(meta["q01"], dtype=np.float64)
+    high = np.asarray(meta["q99"], dtype=np.float64)
+    mask = np.asarray(meta.get("mask", np.ones_like(low, dtype=bool)), dtype=bool)
+
+    discretized = vocab_size - token_ids
+    discretized = np.clip(discretized - 1, 0, bin_centers.shape[0] - 1)
+    normalized = bin_centers[discretized]
+    actions = np.where(mask, 0.5 * (normalized + 1.0) * (high - low) + low, normalized)
+    return np.asarray(actions, dtype=np.float64)
 
 
 def prompt_for(instruction: str) -> str:

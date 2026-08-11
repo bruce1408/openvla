@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# 13_nsys_cpu_overhead.py - 用 nsys 采集 Edge-LLM 的 host 侧 CPU 开销 (文档 §7)
+# 14c_nvfp4_nsys_cpu_overhead.py - 用 nsys 采集 NVFP4 Edge-LLM 的 host 侧 CPU 开销 (NVFP4 文档 §7)
 # =============================================================================
 #
 # 目标 (文档 §7):
@@ -15,8 +15,8 @@
 #   3. 汇总关注项 (cudaStreamSynchronize/cudaMemcpy*/cudaLaunchKernel/...) → JSON
 #
 # 用法:
-#   python 13_nsys_cpu_overhead.py
-#   python 13_nsys_cpu_overhead.py --warmup 3
+#   python 14c_nvfp4_nsys_cpu_overhead.py
+#   python 14c_nvfp4_nsys_cpu_overhead.py --warmup 3
 # =============================================================================
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ import subprocess
 from pathlib import Path
 
 EDGE_LLM_DIR = Path(os.environ.get("EDGE_LLM_DIR", "/workspace/TensorRT-Edge-LLM"))
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[4]
 ARTIFACTS = REPO / "deploy/tensorrt/artifacts"
-LLM_ENGINE_DIR = ARTIFACTS / "engines/openvla_llama_fp8"
+LLM_ENGINE_DIR = ARTIFACTS / "engines/openvla_llama_nvfp4"
 EDGELLM_BIN = EDGE_LLM_DIR / "build/examples/llm/llm_inference"
 PLUGIN = EDGE_LLM_DIR / "build/libNvInfer_edgellm_plugin.so"
 SMOKE_INPUT = ARTIFACTS / "smoke_input.json"
@@ -49,7 +49,7 @@ def run_nsys(tag: str, warmup: int) -> Path:
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = "/usr/lib/aarch64-linux-gnu:" + env.get("LD_LIBRARY_PATH", "")
     env["EDGELLM_PLUGIN_PATH"] = str(PLUGIN)
-    rep = LOGS_DIR / f"fp8_nsys_{tag}"
+    rep = LOGS_DIR / f"nvfp4_nsys_{tag}"
     cmd = [
         NSYS, "profile", "-t", "cuda,nvtx", "-o", str(rep), "--force-overwrite", "true",
         str(EDGELLM_BIN),
@@ -151,7 +151,7 @@ def main() -> None:
         "top15_all_api_low_run": sorted(rows_lo, key=lambda r: r["total_ms"], reverse=True)[:15],
     }
 
-    out_path = Path(args.output) if args.output else LOGS_DIR / f"fp8_nsys_cpu_overhead_{args.tag}.json"
+    out_path = Path(args.output) if args.output else LOGS_DIR / f"nvfp4_nsys_cpu_overhead_{args.tag}.json"
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"\n--- §7 每次推理 host 侧开销 (差分, /{n_diff} passes) ---")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 onnx_path="${1:-${repo_root}/deploy/tensorrt/artifacts/onnx/vision_projector_fp16.onnx}"
 engine_path="${2:-${repo_root}/deploy/tensorrt/artifacts/engines/vision_projector_fp16.plan}"
 # 第 3 个参数: 精度 fp16 (默认) 或 fp8。fp8 需要输入是已插入 Q/DQ 的量化 ONNX

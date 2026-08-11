@@ -27,15 +27,28 @@ Three constraints must be treated as gates, not assumptions:
 deploy/tensorrt/
 ├── common.py
 ├── pipeline/
-│   ├── 00_dump_golden.py
-│   ├── 01_export_vision_projector_onnx.py
-│   ├── 02_extract_llama_checkpoint.py
-│   ├── 03_convert_llm_x86.sh
-│   ├── 04_export_action_params.py
-│   ├── 05_build_vision_engine.sh
-│   ├── 06_measure_llm_latency.sh
-│   ├── 07_measure_e2e_latency.py
-│   └── 08_measure_component_latency.sh
+│   ├── fp16/          # FP16/BF16 基准导出与 vision engine 构建
+│   │   ├── 00_dump_golden.py
+│   │   ├── 01_export_vision_projector_onnx.py
+│   │   ├── 02_extract_llama_checkpoint.py
+│   │   ├── 03_convert_llm_x86.sh
+│   │   ├── 04_export_action_params.py
+│   │   └── 05_build_vision_engine.sh
+│   ├── fp8/           # FP8 量化、评测与 profiling
+│   │   ├── 01b_quantize_vision_fp8.py
+│   │   ├── 06_measure_llm_latency.sh
+│   │   ├── 09_prof_trace_e2e.py
+│   │   ├── 10_operator_categories.py
+│   │   ├── 11_measure_fp8_trt.py
+│   │   ├── 12_fp8_action_accuracy.py
+│   │   └── 13_nsys_cpu_overhead.py
+│   └── nvfp4/         # NVFP4 量化路径评测与时延
+│       ├── 07_measure_e2e_latency.py
+│       ├── 08_measure_component_latency.sh
+│       ├── 14_nvfp4_action_accuracy.py
+│       ├── 14_nvfp4_collect_all.sh
+│       ├── 14b_nvfp4_token_accuracy.py
+│       └── 14c_nvfp4_nsys_cpu_overhead.py
 ├── runtime/
 │   ├── trt_runner.py
 │   ├── hybrid_runtime.py
@@ -97,7 +110,7 @@ excludes the first token, which is produced by prefill.
 ## 2. Gate 1: dump the golden tensors
 
 ```bash
-python deploy/tensorrt/pipeline/00_dump_golden.py \
+python deploy/tensorrt/pipeline/fp16/00_dump_golden.py \
   --image test_data/bridge_sample_0001.jpg \
   --instruction "pick up the blue object" \
   --unnorm-key bridge_orig \
@@ -120,7 +133,7 @@ Repeat the dump on a representative fixed validation set, not only one image, be
 Export FP16 first:
 
 ```bash
-python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
+python deploy/tensorrt/pipeline/fp16/01_export_vision_projector_onnx.py \
   --mode combined \
   --opset 17
 ```
@@ -128,7 +141,7 @@ python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
 If export fails, isolate the failing branch:
 
 ```bash
-python deploy/tensorrt/pipeline/01_export_vision_projector_onnx.py \
+python deploy/tensorrt/pipeline/fp16/01_export_vision_projector_onnx.py \
   --mode split \
   --opset 17
 ```
@@ -155,7 +168,7 @@ TensorRT plans are hardware/software-specific. Build the plan on the target Thor
 plan built on a different GPU or TensorRT release.
 
 ```bash
-bash deploy/tensorrt/pipeline/05_build_vision_engine.sh
+bash deploy/tensorrt/pipeline/fp16/05_build_vision_engine.sh
 ```
 
 The default command fixes the only supported input to `1x6x224x224`, enables FP16, and writes:
@@ -212,7 +225,7 @@ When token 1 matches and a later token differs, inspect the cache length, positi
 ## 7. Export the action sidecar
 
 ```bash
-python deploy/tensorrt/pipeline/04_export_action_params.py \
+python deploy/tensorrt/pipeline/fp16/04_export_action_params.py \
   --unnorm-key bridge_orig
 ```
 
@@ -236,7 +249,7 @@ public workflow is checkpoint -> `tensorrt-edgellm-export` -> `llm_build` -> C++
 Extract the fine-tuned language model, not base Llama 2:
 
 ```bash
-python deploy/tensorrt/pipeline/02_extract_llama_checkpoint.py \
+python deploy/tensorrt/pipeline/fp16/02_extract_llama_checkpoint.py \
   --device cpu
 ```
 

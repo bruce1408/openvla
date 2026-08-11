@@ -44,6 +44,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 import numpy as np
 
@@ -98,8 +99,7 @@ def load_vision_engine(engine_path: Path):
 
 def profile_vision(engine_path: Path, warmup: int, active: int, output_dir: Path, tag: str) -> dict:
     """用 torch.profiler trace vision engine 的 CUDA kernel。"""
-    import torch
-    from torch.profiler import ProfilerActivity, profile, record_function, schedule
+    
 
     vision_precision = infer_precision(engine_path)
     context, in_name, out_name, in_shape, out_shape, inp, out, stream = load_vision_engine(engine_path)
