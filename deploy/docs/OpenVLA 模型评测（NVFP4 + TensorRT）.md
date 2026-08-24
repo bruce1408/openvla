@@ -2,11 +2,11 @@
 
 OpenVLA FP8 视觉 + NVFP4 LLM + TensorRT 在 Thor 上的 E2E 推理时延为 **144.6 ms（~6.92 Hz）**，相比 BF16 Eager baseline（466 ms）加速 **3.23×**。
 
-> **📌 一句话结论：** NVFP4 把 E2E 压到 144.6 ms / 6.92 Hz（比 FP8 再快 1.59×），Decode 仍 Memory-Bound，**但精度严重退化且极不稳定：20 样本均值仅 2.05/7 token 一致、RMSE 均值 0.026（最坏 0.072、漂移 139 bin）——4-bit 对 OpenVLA 连续动作回归不足，当前不可生产部署。**
+> **📌 一句话结论：** NVFP4 把 E2E 压到 144.6 ms / 6.92 Hz（比 FP8 再快 1.59×），Decode 仍 Memory-Bound，**但精度严重退化且极不稳定：20 样本均值仅 2.05/7 token 一致、RMSE 均值 0.026（最坏 0.072）；同口径 FP8 为 4.25/7、RMSE 0.015——4-bit 对 OpenVLA 连续动作回归不足，当前不可生产部署。**
 
 > **文档定位：** 本文件是 [OpenVLA 模型评测（FP8 + TensorRT）](OpenVLA%20模型评测（FP8%20%2B%20TensorRT）.md) 的 NVFP4 姊妹篇。核心变化：LLM 权重由 FP8（8-bit）进一步量化为 **NVFP4（4-bit）**，而视觉编码器沿用 FP8 engine（未单独做 4-bit，占 E2E 仅 ~7% 且非瓶颈）。目标读者同为硬件/编译器同事——重点回答：**4-bit 量化后算子行为怎么变、decode 是否仍 Memory-Bound、精度损失是否可接受、能否进一步逼近实时控制（>10 Hz）**。
 
-> **⚠️ 数据口径提示（重要）：** 本文 §1.4/§3/§4/§5/§7 均为实测（2026-08-11 复验）。**Vision 6.51 ms 用的是 FP8 视觉 engine**。**已实测：§1.4 逐层 dtype、§3.1–3.4 精度（含 20 样本 + FP8 对照）、§4 时延/显存、§5 算子、§7 CPU 开销。**
+> **⚠️ 数据口径提示（重要）：** 本文 §1.4/§3/§4/§5/§7 均为实测（2026-08-11 / 2026-08-14 复验）。**Vision 6.51 ms 用的是 FP8 视觉 engine**。**已实测：§1.4 逐层 dtype、§3.1–3.4 精度（含 NVFP4/FP8 各 20 样本 golden-emb + NVFP4 20 样本端到端 action）、§4 时延/显存、§5 算子、§7 CPU 开销。**
 
 ---
 
@@ -25,7 +25,7 @@ OpenVLA FP8 视觉 + NVFP4 LLM + TensorRT 在 Thor 上的 E2E 推理时延为 **
 
 | 模块 | 量化策略 | 实测结果 |
 |---|---|---|
-| Vision Backbone + Projector | **FP8 PTQ（沿用，非 nvfp4）** | 复用 `vision_projector_fp8.plan`；E2E 侧实测 vision **10.74 ms**，占 E2E ~7.3% |
+| Vision Backbone + Projector | **FP8 PTQ（沿用，非 nvfp4）** | 复用 `vision_projector_fp8.plan`；E2E 主表 vision **6.51 ms**，占 E2E ~4.5% |
 | MLP Projector | FP8 PTQ | 已与 Vision 融进同一 engine |
 | Llama Decoder 32 层 | **NVFP4 PTQ（LLM 收益核心）** | decode 每步 **60.4 → 17.46 ms（~3.46×）**；engine `llm.engine` = **3.92 GB**（见 §1.3 体积） |
 | lm_head | NVFP4 PTQ | 已融入 Edge-LLM engine |
@@ -91,8 +91,8 @@ OpenVLA FP8 视觉 + NVFP4 LLM + TensorRT 在 Thor 上的 E2E 推理时延为 **
 
 | 项目 | BF16 baseline | NVFP4 本实验（实际） |
 |---|---|---|
-| 输入 | 1 × 224² + 19 tokens → 6 步 | Vision 用随机 224² 张量（fp8 engine 计时）；LLM 用纯文本 prompt |
-| 轮数 | 10 轮取均值 | iters=10，warmup=3，repeat=5（`e2e_nvfp4` json） |
+| 输入 | 1 × 224² + 19 tokens → 6 步 | Vision 用真实 224² 图像（fp8 engine）；LLM 用 golden multimodal embedding / 真实 vision 注入 |
+| 轮数 | 10 轮取均值 | 主表 E2E：iters=20，warmup=5，repeat=30（`e2e_nvfp4_2026_0807`） |
 | 精度 | BF16 | 视觉 FP8 + LLM NVFP4 |
 | Trace | 3 个 chrome trace | ✅ nvfp4 已采集：`vision_trace_fp8_nvfp4_full.trace.json`（视觉）+ LLM `llm_profile_nvfp4_full.json` + nsys（§5/§7）|
 
@@ -188,7 +188,7 @@ python deploy/tensorrt/pipeline/nvfp4/14_nvfp4_action_accuracy.py \
 | max abs err | 0.06931（yaw） | **0.00484（yaw）** |
 | token 完全一致 | 1/7 | 0/7（但 dz/gripper 物理值碰巧对齐）|
 
-> **重要解读：** 端到端 action 路径 RMSE 看似更低（0.00233），是因为 **FP8 vision 注入的 embedding 与 golden-emb 不同**，导致 NVFP4 输出了不同的 token 集合，物理值"碰巧"更接近 golden——**不代表 NVFP4 LLM 量化精度更好**。golden-emb 才是隔离 LLM 量化误差的权威口径（RMSE 0.02886，严重退化）。
+> **重要解读：** 端到端 action 路径 RMSE 看似更低（0.00233），是因为 **FP8 vision 注入的 embedding 与 golden-emb 不同**，导致 NVFP4 输出了不同的 token 集合，物理值"碰巧"更接近 golden——**不代表 NVFP4 LLM 量化精度更好**。golden-emb 才是隔离 LLM 量化误差的权威口径（RMSE 0.02886，严重退化）。**20 样本端到端复验（§3.2.4）确认：action RMSE 均值 0.024，与 golden-emb 均值 0.026 同量级；sample_0001 的 0.00233 是碰巧，不能外推。**
 
 ---
 
@@ -248,17 +248,69 @@ python deploy/tensorrt/pipeline/nvfp4/14_nvfp4_action_accuracy.py \
 python deploy/tensorrt/pipeline/nvfp4/15_nvfp4_multi_sample_accuracy.py --start 1 --end 20
 ```
 
+### 3.2.3 FP8 20 样本对照（✅ 已实测，同 harness / 同 golden）
+
+> **状态：✅ 已完成（2026-08-14）。** 用 `15_nvfp4_multi_sample_accuracy.py --skip-dump --llm-engine .../openvla_llama_fp8` 跑同一批 sample_0001–0020。产物：`outputs/openvla/fp8_multi_sample_accuracy.json`。
+
+| 指标 | FP8（20 样本） | **NVFP4（20 样本）** |
+| --- | --- | --- |
+| token 完全一致（均值 / 中位） | **4.25 / 4.0** | **2.05 / 1.0** |
+| token 完全一致（范围） | 1–7（**4/20 达 7/7**） | 1–7（仅 1/20 达 7/7） |
+| 最大 bin 漂移（均值 / 最坏） | 34.1 / **153** | 58.7 / **139** |
+| RMSE（均值 / 中位 / p95 / 最坏） | **0.0153 / 0.0028 / 0.060 / 0.063** | **0.0262 / 0.0225 / 0.062 / 0.072** |
+| RMSE > 0.05 的样本 | 3/20（0008/0013/0019） | 3/20（0008/0011/0013） |
+| token 一致 ≥ 4/7 | **14/20** | **3/20** |
+
+**FP8 逐维度（20 样本）：**
+
+| 维度 | 完全一致率 | 平均 bin 漂移 | p95 漂移 | 最大漂移 |
+| --- | --- | --- | --- | --- |
+| gripper | **20/20（100%）** | 0 | 0 | 0 |
+| dx | 14/20（70%） | 7.8 | 47 | 55 |
+| dy | 12/20（60%） | 9.3 | 58 | 75 |
+| dz | 12/20（60%） | 4.3 | 21 | 24 |
+| roll | 10/20（50%） | 5.2 | 17 | 43 |
+| yaw | 10/20（50%） | 19.7 | 93 | 101 |
+| **pitch** | **7/20（35%）** | **27.2** | **95** | **153** |
+
+> **解读：** 同口径下 NVFP4 相对 FP8：token 一致均值 **4.25 → 2.05（↓52%）**，RMSE 均值 **0.015 → 0.026（↑1.72×）**，≥4/7 样本从 14/20 降到 3/20。**FP8 也不是"全稳"**——最坏漂移 153 bin、3/20 RMSE>0.05，pitch 仍最敏感；但中位数 RMSE 仅 0.0028，多数样本可用。NVFP4 中位数 RMSE 0.0225，多数样本已不可用。**sample_0001 的 FP8 4/7、max 5 bin 接近均值，不是挑好样本。**
+
+### 3.2.4 端到端 action 多样本（FP8 vision + NVFP4 LLM，✅ 已实测）
+
+> **状态：✅ 已完成（2026-08-14）。** `16_nvfp4_multi_sample_action.py` 对 sample_0001–0020 跑真实 FP8 vision → NVFP4 LLM。产物：`outputs/openvla/nvfp4_multi_sample_action.json`。
+
+| 指标 | golden-emb（§3.2） | **action 端到端（20 样本）** |
+| --- | --- | --- |
+| token 完全一致（均值） | 2.05 / 7 | **2.15 / 7** |
+| 最大 bin 漂移（最坏） | 139 | **182**（sample_0010 yaw） |
+| RMSE（均值 / 中位 / 最坏） | 0.0262 / 0.0225 / 0.0717 | **0.0242 / 0.0164 / 0.112** |
+| RMSE > 0.05 | 3/20 | 2/20（0010/0011） |
+| 7/7 完美 | 1/20 | **0/20** |
+
+> **解读：** 20 样本端到端 RMSE 均值 **0.024**，与 golden-emb 均值 **0.026** 同量级。§3.1.2 单样本 action RMSE 0.00233 **不能外推**——最坏样本 0010 RMSE 0.112、yaw 漂 182 bin。两条路径都确认：**NVFP4 精度严重退化且方差极大**。golden-emb 仍是隔离 LLM 量化误差的权威口径。
+
+**采集命令：**
+
+```bash
+python deploy/tensorrt/pipeline/nvfp4/15_nvfp4_multi_sample_accuracy.py \
+  --skip-dump --start 1 --end 20 \
+  --llm-engine deploy/tensorrt/artifacts/engines/openvla_llama_fp8 \
+  --output outputs/openvla/fp8_multi_sample_accuracy.json
+
+python deploy/tensorrt/pipeline/nvfp4/16_nvfp4_multi_sample_action.py --start 1 --end 20
+```
+
 ---
 
-## 3.3 敏感性分析（✅ 已完成，20 样本 + §1.4 逐层 dtype）
+## 3.3 敏感性分析（✅ 已完成，20 样本 + FP8 对照 + §1.4 逐层 dtype）
 
-> **状态：✅ 已完成。** 单样本（§3.1）+ 20 样本逐维聚合（§3.2.2）+ inspector fallback 层定位。
+> **状态：✅ 已完成。** 单样本（§3.1）+ NVFP4/FP8 各 20 样本逐维聚合（§3.2.2–3.2.3）+ 端到端 20 样本（§3.2.4）+ inspector fallback 层定位。
 
 **维度敏感度（20 样本聚合，按平均 bin 漂移排序）：**
 
 | 敏感度 | 维度 | 平均 bin 漂移 | p95 漂移 | 完全一致率 | 推测原因 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 最高 | **pitch** | 45.1 | 99 | 10% | 连续旋转维 logits 分布窄，4-bit 量化后 argmax 最易翻转 |
+| 🔴 最高 | **pitch** | 45.1 | 99 | 10% | 连续旋转维 logits 分布窄；FP8 对照同样最敏感（一致率 35%、最大 153 bin），4-bit 进一步放大 |
 | 🔴 高 | yaw | 33.1 | 99 | 10% | 同上 |
 | 🟠 中高 | dy、dx | 17.6、16.6 | 70、52 | 20%、35% | 平移维仍有显著漂移 |
 | 🟡 中 | dz、roll | 13.4、12.8 | 34、52 | 15% | 仍有漂移但量级较小 |
@@ -271,7 +323,7 @@ python deploy/tensorrt/pipeline/nvfp4/15_nvfp4_multi_sample_accuracy.py --start 
 1. 对 **lm_head + 末 4–8 个 decoder block 的 linear** 强制 FP8/FP16（inspector fallback 层已定位 `node_linear_*` 系列）；
 2. 对 **yaw/pitch/roll 运动维度** 做混合精度 PTQ 后 per-layer 回退；
 3. 多样本评测显示精度**方差极大**（1/7–7/7），任何修复必须过 ≥20 样本 regression gate；
-4. 若混合精度仍不足，LLM 回退 FP8（已知均值更稳，FP8 对照 4/7 一致）。
+4. 若混合精度仍不足，LLM 回退 FP8（20 样本均值 4.25/7、RMSE 0.015，中位数 RMSE 0.0028，多数样本可用；仍有 3/20 坏样本，pitch 敏感）。
 
 ---
 
@@ -284,8 +336,9 @@ python deploy/tensorrt/pipeline/nvfp4/15_nvfp4_multi_sample_accuracy.py --start 
 | **单样本 token 一致（sample_0001）** | 4/7 | **1/7** | ↓ 75% |
 | **单样本 max bin 漂移** | 5 | **43** | ↑ 8.6× |
 | **单样本 golden-emb RMSE** | 0.00162 | **0.02886** | ↑ 17.8× |
-| **20 样本 token 一致（均值）** | — | **2.05/7** | — |
-| **20 样本 RMSE（均值 / p95 / 最坏）** | — | **0.026 / 0.062 / 0.072** | — |
+| **20 样本 token 一致（均值）** | **4.25/7** | **2.05/7** | ↓ 52% |
+| **20 样本 RMSE（均值 / p95 / 最坏）** | **0.015 / 0.060 / 0.063** | **0.026 / 0.062 / 0.072** | ↑ 1.72×（均值） |
+| **20 样本 ≥4/7 一致** | **14/20** | **3/20** | — |
 | LLM engine 体积 | ~6.75 GB | **3.92 GB** | ↓ 42% |
 | LLM decode（ms/step） | 29.49 | **17.64** | ↓ 1.67× |
 | E2E（ms / Hz）| 231.9 / 4.31 | **144.6 / 6.92** | ↓ 1.60× |
@@ -293,7 +346,7 @@ python deploy/tensorrt/pipeline/nvfp4/15_nvfp4_multi_sample_accuracy.py --start 
 | 量化输出占比（inspector）| ~99% | **57.8%** | — |
 | Half fallback 层数 | 极少 | **328 / 1194** | — |
 
-> **一句话：** NVFP4 用 **~40% 更少显存、~1.6× 更快 E2E**，换取 **~18× RMSE 退化 + 精度方差极大**——速度/体积收益真实，**精度代价不可接受**。
+> **一句话：** NVFP4 用 **~40% 更少显存、~1.6× 更快 E2E**，换取 20 样本 RMSE 均值 **0.015 → 0.026（↑1.72×）**、token 一致 **4.25 → 2.05/7**——速度/体积收益真实，**精度代价不可接受**。单样本 RMSE 17.8×（0.00162 vs 0.02886）偏悲观，多样本均值约 1.7×，但 NVFP4 中位数已跨过可用线。
 
 ### 3.4.1 Harness 验证门（textcheck，⚠️ 有限验证）
 
@@ -485,9 +538,9 @@ python deploy/tensorrt/pipeline/nvfp4/14_nvfp4_action_accuracy.py --mode textche
 |---|---|---|
 | 1 | E2E 466 → **145 ms**，加速 **3.23×**，可达 **6.92 Hz** | 相比 fp8（4.35 Hz）再快 1.59×；满足 >3 Hz 实时控制，但仍未到 10 Hz+ |
 | 2 | **Decode 加速最显著（3.46×）**，仍 Memory-Bound | 权重 8-bit→4-bit 减半 → decode 访存再减半（实测 88% GEMM 主导）|
-| 3 | **精度：20 样本 RMSE 均值 0.026（最坏 0.072）、2.05/7 token 一致；pitch 最敏感（平均漂移 45 bin）** | 4-bit 对 7-DoF 连续动作回归精度不足且方差极大；**生产部署前必须混合精度或换格式** |
+| 3 | **精度：NVFP4 20 样本 RMSE 均值 0.026（最坏 0.072）、2.05/7 token 一致；同口径 FP8 为 0.015 / 4.25/7；pitch 最敏感** | 4-bit 对 7-DoF 连续动作回归精度不足且方差极大；端到端 20 样本 RMSE 均值 0.024 印证；**生产部署前必须混合精度或换格式** |
 | 4 | LLM engine 体积 3.92 GB（≈bf16 的 0.29×）；**峰值显存 4182 MB（较 FP8 ↓40%）**| 4-bit 权重 + 块缩放 scale；KV 仍 fp16 有待压 |
-| 5 | 视觉仍用 FP8 engine（10.74 ms，~7.3%）| nvfp4 未量化视觉；若要再压需视觉 4-bit（但需先解决 LLM 精度）|
+| 5 | 视觉仍用 FP8 engine（**6.51 ms**，占 E2E ~4.5%）| nvfp4 未量化视觉；若要再压需视觉 4-bit（但需先解决 LLM 精度）|
 | 6 | CPU 开销：**调度/搬运 ↓99%（~2.6 ms）已实测** | nsys 差分：CUDA Graph 折叠 launch（1.27ms）+ graph（1.31ms）；剩 `cudaStreamSynchronize` 110ms 是 GPU-wait 非调度残余（与 FP8 同机制）|
 
 ---
@@ -512,11 +565,14 @@ python deploy/tensorrt/pipeline/nvfp4/14_nvfp4_action_accuracy.py --mode textche
 | `outputs/openvla/nvfp4_action_accuracy_golden-emb.json` | **§3.1.1 golden-emb RMSE=0.02886** | ✅ |
 | `outputs/openvla/nvfp4_action_accuracy_action.json` | **§3.1.2 端到端 action RMSE=0.00233** | ✅ |
 | `outputs/openvla/nvfp4_multi_sample_accuracy.json` | **§3.2 20 样本聚合（rmse_mean=0.0262）** | ✅ |
+| `outputs/openvla/fp8_multi_sample_accuracy.json` | **§3.2.3 FP8 20 样本对照（rmse_mean=0.0153，exact=4.25/7）** | ✅ |
+| `outputs/openvla/nvfp4_multi_sample_action.json` | **§3.2.4 端到端 action 20 样本（rmse_mean=0.0242）** | ✅ |
 | `outputs/openvla/nvfp4_textcheck_harness.json` | §3.4.1 harness textcheck token | ✅ |
 | `outputs/openvla/nvfp4_textcheck_llm_inference.json` | §3.4.1 llm_inference 对照（纯文本乱码，非 golden 路径）| ✅ |
 | `outputs/openvla/e2e_fp8_2026_0811_164456.json` | §3.4 / §4.0 FP8 E2E 对照（231.9 ms）| ✅ |
 | `deploy/tensorrt/artifacts/engines/openvla_llama_nvfp4_detailed/` | detailed engine（inspector 用）| ✅ |
-| `deploy/tensorrt/pipeline/nvfp4/15_nvfp4_multi_sample_accuracy.py` | 多样本 dump + 聚合 | — |
+| `deploy/tensorrt/pipeline/nvfp4/15_nvfp4_multi_sample_accuracy.py` | 多样本 dump + golden-emb 聚合 | — |
+| `deploy/tensorrt/pipeline/nvfp4/16_nvfp4_multi_sample_action.py` | 多样本端到端 action | — |
 | `/data/checkpoints/openvla/hf_llama_onnx_nvfp4/llm/` | NVFP4 ONNX 源（构建 engine 用）| ✅ |
 | `deploy/tensorrt/artifacts/engines/openvla_llama_nvfp4/` | NVFP4 LLM TRT engine（推理用）| ✅ |
 | `deploy/tensorrt/pipeline/nvfp4/14b_nvfp4_token_accuracy.py` | token 级精度采集 | — |
@@ -534,7 +590,9 @@ python deploy/tensorrt/pipeline/nvfp4/14_nvfp4_action_accuracy.py --mode textche
 | §3.1.1 | golden-emb RMSE | ✅ 已完成 | `14_nvfp4_action_accuracy.py --mode golden-emb` |
 | §3.1.2 | 端到端 action RMSE | ✅ 已完成 | `--mode action` |
 | §3.2 | 多样本（20 张）| ✅ 已完成 | `15_nvfp4_multi_sample_accuracy.py --start 1 --end 20` |
-| §3.4 | FP8 vs NVFP4 总对照 | ✅ 已完成 | 汇总 `fp8_control_token_accuracy.json` + `e2e_fp8_2026_0811` + §3.2 |
+| §3.2.3 | FP8 20 样本对照 | ✅ 已完成 | `15_* --skip-dump --llm-engine .../openvla_llama_fp8` |
+| §3.2.4 | 端到端 action 20 样本 | ✅ 已完成 | `16_nvfp4_multi_sample_action.py --start 1 --end 20` |
+| §3.4 | FP8 vs NVFP4 总对照 | ✅ 已完成 | 汇总 `fp8_multi_sample_accuracy.json` + `e2e_fp8_2026_0811` + §3.2 |
 | §3.4.1 | Harness textcheck | ✅ 已完成 | `14_nvfp4_action_accuracy.py --mode textcheck` |
 | §4 | E2E 时延 + 峰值显存 | ✅ 已完成 | `python deploy/tensorrt/pipeline/nvfp4/01_measure_e2e_latency.py --precision nvfp4` |
 | §4.2 | 组件时延 | ✅ 已完成 | `bash deploy/tensorrt/pipeline/nvfp4/08_measure_component_latency.sh` |
@@ -558,12 +616,12 @@ bash deploy/tensorrt/pipeline/nvfp4/14_nvfp4_collect_all.sh
 | 优先级 | 实验项 | 当前状态 | 建议方法 / 通过标准 |
 | --- | --- | --- | --- |
 | P0 | **混合精度 PTQ**（lm_head + 末 4–8 block 回退 FP8）| ❌ 未做 | 重新 `tensorrt-edgellm-quantize` + `llm_build`；20 样本 RMSE 均值 < 0.005、token 一致 ≥ 5/7 |
-| P0 | **FP8 20 样本对照**（同 harness）| ❌ 未做 | 扩展 `15_*` 脚本跑 FP8 engine；与 NVFP4 §3.2 同口径对比 |
-| P1 | **端到端 action 多样本**（FP8 vision + NVFP4 LLM）| ❌ 仅 sample_0001 | `14_nvfp4_action_accuracy.py --mode action` 批量；**仅作参考**，golden-emb 仍是权威 |
+| P0 | **FP8 20 样本对照**（同 harness）| ✅ 已完成 | `fp8_multi_sample_accuracy.json`：exact 4.25/7，RMSE 0.0153 |
+| P1 | **端到端 action 多样本**（FP8 vision + NVFP4 LLM）| ✅ 已完成 | `nvfp4_multi_sample_action.json`：RMSE 均值 0.0242，最坏 0.112 |
 | P1 | **KV-cache fp16→fp8/fp4** | ❌ 未做 | Edge-LLM config 改 `kv_cache_dtype`；测 decode ms/step + 精度 regression |
 | P2 | **Vision NVFP4** | ❌ 未做 | 视觉占 E2E ~7%，收益有限；须 LLM 精度先过关 |
 | P2 | **Speculative decoding** | ❌ 未做 | Edge-LLM `--specDecode`；测 E2E Hz + 动作精度 |
 | P2 | **更大评测集（>20 张 / 真机轨迹）** | ❌ 未做 | bridge 20 张已显示高方差；真机闭环为最终 gate |
 | P3 | **textcheck token 级与 llm_inference 逐 token 对齐** | ⚠️ 部分 | OpenVLA 多模态下纯文本非主路径；multimodal golden-emb 对照已足够 |
 
-**本文已覆盖、无需重复采集：** E2E 时延、逐层 dtype、算子类别、CPU 开销、单样本 + 20 样本 golden-emb 精度、FP8 单样本对照、harness 方法验证。
+**本文已覆盖、无需重复采集：** E2E 时延、逐层 dtype、算子类别、CPU 开销、单样本 + 20 样本 golden-emb（NVFP4/FP8）、20 样本端到端 action、harness 方法验证。
