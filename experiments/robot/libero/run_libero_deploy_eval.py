@@ -50,6 +50,31 @@ def parse_task_ids(value: str, num_tasks: int) -> list[int]:
     return sorted(selected)
 
 
+def parse_episode_spec(value: str, num_tasks: int) -> dict[int, list[int]]:
+    """Parse `task_id:ep_start-ep_end` segments into per-task episode indices."""
+
+    assignment: dict[int, set[int]] = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid episode spec segment {item!r}; expected task_id:episode_or_range")
+        task_text, episode_text = item.split(":", 1)
+        task_id = int(task_text)
+        if task_id < 0 or task_id >= num_tasks:
+            raise ValueError(f"episode spec task_id {task_id} out of range [0, {num_tasks})")
+        if "-" in episode_text:
+            start_text, end_text = episode_text.split("-", 1)
+            episode_indices = range(int(start_text), int(end_text) + 1)
+        else:
+            episode_indices = [int(episode_text)]
+        assignment.setdefault(task_id, set()).update(episode_indices)
+    if not assignment:
+        raise ValueError("episode spec is empty")
+    return {task_id: sorted(indices) for task_id, indices in assignment.items()}
+
+
 def set_seed(seed: int) -> None:
     import torch
 
@@ -224,6 +249,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--revision", default=None)
     parser.add_argument("--task-suite-name", choices=tuple(TASK_MAX_STEPS), default="libero_spatial")
     parser.add_argument("--task-ids", default="all", help="all, a comma list, or ranges such as 0,2-4")
+    parser.add_argument(
+        "--episode-spec",
+        default=None,
+        help="Balanced shard format: task_id:ep_start-ep_end,... e.g. 0:0-24,1:0-12",
+    )
     parser.add_argument("--num-trials-per-task", type=int, default=50)
     parser.add_argument("--num-steps-wait", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=None, help="Override the suite episode horizon")
@@ -260,6 +290,17 @@ def main() -> None:
     os.environ.setdefault("MUJOCO_GL", "egl")
     set_seed(args.seed)
 
+    # LIBERO loads init-state pickles via torch.load; PyTorch 2.6+ defaults weights_only=True.
+    import torch
+
+    _torch_load = torch.load
+
+    def _torch_load_compat(*load_args, **load_kwargs):
+        load_kwargs.setdefault("weights_only", False)
+        return _torch_load(*load_args, **load_kwargs)
+
+    torch.load = _torch_load_compat  # type: ignore[method-assign]
+
     try:
         from libero.libero import benchmark, get_libero_path
         from libero.libero.envs import OffScreenRenderEnv
@@ -270,7 +311,12 @@ def main() -> None:
         ) from exc
 
     suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
-    task_ids = parse_task_ids(args.task_ids, suite.n_tasks)
+    if args.episode_spec:
+        episode_plan = parse_episode_spec(args.episode_spec, suite.n_tasks)
+        task_ids = sorted(episode_plan.keys())
+    else:
+        episode_plan = None
+        task_ids = parse_task_ids(args.task_ids, suite.n_tasks)
     horizon = args.max_steps or TASK_MAX_STEPS[args.task_suite_name]
     policy = create_policy(args)
 
@@ -299,17 +345,30 @@ def main() -> None:
         "center_crop": args.center_crop,
         "preprocessing": args.preprocessing,
     }
+    if args.episode_spec:
+        run_config["episode_spec"] = args.episode_spec
     if args.resume and summary_path.is_file():
         previous = json.loads(summary_path.read_text(encoding="utf-8"))
         if previous.get("run_config") != run_config:
             raise SystemExit("Resume configuration differs from the existing summary; use a new --run-name")
 
     print(f"Backend: {args.backend} | suite: {args.task_suite_name} | tasks: {task_ids}")
+    if args.episode_spec:
+        planned = sum(len(indices) for indices in episode_plan.values())
+        print(f"Episode spec: {args.episode_spec} ({planned} episodes)")
     print(f"Results: {result_path}")
     for task_id in task_ids:
         task = suite.get_task(task_id)
         initial_states = suite.get_task_init_states(task_id)
-        if args.num_trials_per_task > len(initial_states):
+        episode_indices = (
+            episode_plan[task_id] if episode_plan is not None else list(range(args.num_trials_per_task))
+        )
+        if max(episode_indices) >= len(initial_states):
+            raise ValueError(
+                f"Task {task_id} has {len(initial_states)} initial states, "
+                f"but episode index {max(episode_indices)} was requested"
+            )
+        if not episode_plan and args.num_trials_per_task > len(initial_states):
             raise ValueError(
                 f"Task {task_id} has {len(initial_states)} initial states, "
                 f"but {args.num_trials_per_task} trials were requested"
@@ -322,7 +381,7 @@ def main() -> None:
         )
         env.seed(args.env_seed)
         try:
-            for episode_idx in range(args.num_trials_per_task):
+            for episode_idx in episode_indices:
                 if (task_id, episode_idx) in completed:
                     continue
                 action_latencies: list[float] = []

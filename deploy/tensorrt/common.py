@@ -12,14 +12,41 @@ from typing import Any
 # 这些环境变量将不生效,离线加载会去错误的空 hub 目录从而报 LocalEntryNotFoundError。
 from runtime_env import MODEL_PATH, MODEL_REVISION  # noqa: E402  (must precede transformers)
 
+import os
+
 import numpy as np
 import torch
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+
+def _default_unnorm_key() -> str:
+    """Pick action-stats key: explicit env, else infer from the local model directory name."""
+
+    env_key = os.environ.get("OPENVLA_UNNORM_KEY")
+    name = Path(MODEL_PATH).name.lower()
+    inferred = None
+    for needle, key in (
+        ("libero-spatial", "libero_spatial"),
+        ("libero-object", "libero_object"),
+        ("libero-goal", "libero_goal"),
+        ("libero-10", "libero_10"),
+    ):
+        if needle in name:
+            inferred = key
+            break
+    # env_gpu.sh used to default to bridge_orig even on LIBERO checkpoints.
+    if env_key and not (env_key == "bridge_orig" and inferred is not None):
+        return env_key
+    return inferred or env_key or "bridge_orig"
 
 
 EMPTY_TOKEN_ID = 29871
 DEFAULT_INSTRUCTION = "pick up the blue object"
-DEFAULT_UNNORM_KEY = "bridge_orig"
+DEFAULT_UNNORM_KEY = _default_unnorm_key()
 ACTION_META_PATH = Path(__file__).resolve().parent / "artifacts/action_meta/action_meta.json"
 
 
@@ -80,26 +107,64 @@ def torch_dtype(name: str) -> torch.dtype:
         raise ValueError(f"Unsupported dtype {name!r}; choose from {sorted(mapping)}") from exc
 
 
+def _register_local_openvla() -> None:
+    """Use in-repo Prismatic classes so offline loads do not fetch openvla/openvla-7b *.py.
+
+    LIBERO fine-tune configs keep auto_map pointed at the Hub repo
+    (``openvla/openvla-7b--processing_prismatic.*``). The weight directory only
+    has safetensors, so Auto* + trust_remote_code would try the network.
+    """
+
+    AutoConfig.register("openvla", OpenVLAConfig, exist_ok=True)
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor, exist_ok=True)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor, exist_ok=True)
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction, exist_ok=True)
+
+
+def load_openvla_processor(
+    checkpoint: str | None = None,
+    revision: str | None = None,
+    local_files_only: bool = False,
+) -> PrismaticProcessor:
+    """Load PrismaticProcessor without Hub auto_map fetches."""
+
+    _register_local_openvla()
+    return PrismaticProcessor.from_pretrained(
+        checkpoint or MODEL_PATH,
+        revision=revision if revision is not None else MODEL_REVISION,
+        local_files_only=local_files_only,
+    )
+
+
+def load_openvla_model(
+    checkpoint: str | None = None,
+    revision: str | None = None,
+    device: str = "cuda:0",
+    attn_implementation: str = "sdpa",
+    dtype_name: str = "bf16",
+    local_files_only: bool = False,
+) -> OpenVLAForActionPrediction:
+    """Load OpenVLAForActionPrediction without Hub auto_map fetches."""
+
+    _register_local_openvla()
+    dtype = torch_dtype(dtype_name)
+    model = OpenVLAForActionPrediction.from_pretrained(
+        checkpoint or MODEL_PATH,
+        revision=revision if revision is not None else MODEL_REVISION,
+        attn_implementation=attn_implementation,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        local_files_only=local_files_only,
+    ).to(device)
+    model.eval()
+    return model
+
+
 def load_openvla(device: str, dtype_name: str = "bf16") -> tuple[Any, Any]:
     """Load the pinned OpenVLA processor and model used by this branch."""
 
-    dtype = torch_dtype(dtype_name)
-    processor = AutoProcessor.from_pretrained(
-        MODEL_PATH,
-        revision=MODEL_REVISION,
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    model = AutoModelForVision2Seq.from_pretrained(
-        MODEL_PATH,
-        revision=MODEL_REVISION,
-        attn_implementation="sdpa",
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-        local_files_only=True,
-    ).to(device)
-    model.eval()
+    processor = load_openvla_processor(local_files_only=True)
+    model = load_openvla_model(device=device, dtype_name=dtype_name, local_files_only=True)
     return processor, model
 
 

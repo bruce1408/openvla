@@ -203,6 +203,12 @@ def main() -> None:
     ap.add_argument("--unnorm-key", default="bridge_orig")
     ap.add_argument("--n-new", type=int, default=7)
     ap.add_argument("--output", default=None)
+    ap.add_argument(
+        "--prompt-ids",
+        default="",
+        help="textcheck: comma-separated prompt token ids. Overrides HF tokenizer so "
+        "you can feed the exact Edge-LLM C++ encode() ids.",
+    )
     args = ap.parse_args()
 
     import torch
@@ -217,14 +223,35 @@ def main() -> None:
         # 跑 harness,和 llm_inference 输出 token 比对。
         smoke = json.loads((ARTIFACTS / "smoke_input.json").read_text())
         # smoke_input requests[0] 的 token 需先 tokenize;用 golden 的 input_ids 兜底
-        from deploy.tensorrt.common import load_openvla, prompt_for
-        processor, _ = load_openvla(args.device, "bf16")
-        content = smoke["requests"][0]["messages"][0]["content"] if "requests" in smoke else "In: What action should the robot take to pick up the blue object?\nOut:"
-        ids = processor.tokenizer(content, return_tensors="np")["input_ids"][0]
+        if args.prompt_ids:
+            ids = np.array(
+                [int(x) for x in args.prompt_ids.split(",") if x.strip()],
+                dtype=np.int64,
+            )
+        else:
+            from deploy.tensorrt.common import load_openvla
+
+            processor, _ = load_openvla(args.device, "bf16")
+            content = (
+                smoke["requests"][0]["messages"][0]["content"]
+                if "requests" in smoke
+                else "In: What action should the robot take to pick up the blue object?\nOut:"
+            )
+            # Match Edge-LLM llm_inference: encode(text, addBos=false). Default
+            # add_special_tokens=True would prepend BOS 1 and make this gate invalid.
+            ids = processor.tokenizer(content, add_special_tokens=False, return_tensors="np")["input_ids"][0]
         embeds = emb_tbl[torch.from_numpy(ids).to(args.device)]
         toks = engine.generate(embeds, emb_tbl, args.n_new)
-        result.update({"prompt_token_len": int(len(ids)), "harness_tokens": toks})
+        result.update({
+            "prompt_token_len": int(len(ids)),
+            "prompt_ids": [int(x) for x in ids],
+            "harness_tokens": toks,
+        })
         print(json.dumps(result, indent=2, ensure_ascii=False))
+        if args.output:
+            Path(args.output).write_text(
+                json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
         print("\n>>> 现在运行 llm_inference 对同一 prompt 取 token,人工比对 harness_tokens 是否一致。")
         return
 

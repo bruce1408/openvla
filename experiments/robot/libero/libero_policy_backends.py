@@ -77,25 +77,25 @@ class Bf16Policy:
         local_files_only: bool = False,
     ) -> None:
         import torch
-        from transformers import AutoModelForVision2Seq, AutoProcessor
+
+        from deploy.tensorrt.common import load_openvla_model, load_openvla_processor
 
         self.torch = torch
         self.device = torch.device(device)
         self.checkpoint = checkpoint
         load_args = {
+            "checkpoint": checkpoint,
             "revision": revision,
-            "trust_remote_code": True,
             "local_files_only": local_files_only,
         }
-        self.processor = AutoProcessor.from_pretrained(checkpoint, **load_args)
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            checkpoint,
+        # In-repo Prismatic classes; do not pass trust_remote_code (auto_map hits Hub offline).
+        self.processor = load_openvla_processor(**load_args)
+        self.model = load_openvla_model(
             attn_implementation=attn_implementation,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
+            device=str(self.device),
+            dtype_name="bf16",
             **load_args,
-        ).to(self.device)
-        self.model.eval()
+        )
 
         statistics_path = Path(checkpoint) / "dataset_statistics.json"
         if statistics_path.is_file():
@@ -153,11 +153,10 @@ class Fp8Policy:
         require_provenance: bool = True,
     ) -> None:
         import torch
-        from transformers import AutoProcessor
 
+        from deploy.tensorrt.common import load_openvla_processor
         from deploy.tensorrt.runtime.edge_llm_runner import EdgeLlmRunner
         from deploy.tensorrt.runtime.trt_runner import TensorRTRunner
-
         self.torch = torch
         self.device = torch.device(device)
         self.checkpoint = checkpoint
@@ -186,12 +185,11 @@ class Fp8Policy:
                 f"FP8 artifacts identify source_model={source_model!r}, but --checkpoint={checkpoint!r}"
             )
 
-        load_args = {
-            "revision": revision,
-            "trust_remote_code": True,
-            "local_files_only": local_files_only,
-        }
-        self.processor = AutoProcessor.from_pretrained(checkpoint, **load_args)
+        self.processor = load_openvla_processor(
+            checkpoint=checkpoint,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         self.vision_runner = TensorRTRunner(self.vision_engine_path, device)
         self.llm_runner = EdgeLlmRunner(self.llm_engine_dir, edge_llm_plugin, device)
         self.embedding_table = self.llm_runner.load_embedding_table()

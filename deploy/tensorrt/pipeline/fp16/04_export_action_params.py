@@ -13,9 +13,9 @@ sys.path.insert(0, str(REPO_ROOT))
 from runtime_env import MODEL_PATH, MODEL_REVISION  # noqa: E402 (must precede transformers)
 
 import numpy as np  # noqa: E402
-from transformers import AutoConfig  # noqa: E402
 
 from deploy.tensorrt.common import DEFAULT_UNNORM_KEY, EMPTY_TOKEN_ID, write_json  # noqa: E402
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig  # noqa: E402
 
 
 def main() -> None:
@@ -28,10 +28,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = AutoConfig.from_pretrained(
+    config = OpenVLAConfig.from_pretrained(
         MODEL_PATH,
         revision=MODEL_REVISION,
-        trust_remote_code=True,
         local_files_only=True,
     )
     if args.unnorm_key not in config.norm_stats:

@@ -17,19 +17,27 @@ else
     exit 1
 fi
 
-precision_flags=(--fp16)
-if [[ "${precision}" == "fp8" ]]; then
-    # FP8: Q/DQ 层走 FP8,其余层 FP16 兜底
-    precision_flags=(--fp8 --fp16)
+# TensorRT 10.x 用 --fp16/--fp8 选精度。11.x 默认 strongly-typed，
+# 这两个开关已删除，精度跟 ONNX 里的 dtype / QDQ 走。
+precision_flags=()
+if "${trtexec_bin}" --help 2>&1 | grep -qE '^[[:space:]]+--fp16'; then
+    precision_flags=(--fp16)
+    if [[ "${precision}" == "fp8" ]]; then
+        precision_flags=(--fp8 --fp16)
+    fi
+else
+    echo "trtexec has no --fp16/--fp8 (TensorRT 11+ strongly-typed). Using ONNX dtypes."
+    if [[ "${precision}" == "fp8" ]]; then
+        echo "Expect Q/DQ FP8 nodes in ${onnx_path}"
+    fi
 fi
 
 mkdir -p "$(dirname "${engine_path}")"
-"${trtexec_bin}" \
-    --onnx="${onnx_path}" \
-    --saveEngine="${engine_path}" \
-    "${precision_flags[@]}" \
-    --builderOptimizationLevel=5 \
-    --profilingVerbosity=detailed \
-    --skipInference
+build_cmd=("${trtexec_bin}" --onnx="${onnx_path}" --saveEngine="${engine_path}")
+if ((${#precision_flags[@]})); then
+    build_cmd+=("${precision_flags[@]}")
+fi
+build_cmd+=(--builderOptimizationLevel=5 --profilingVerbosity=detailed --skipInference)
+"${build_cmd[@]}"
 
 echo "Built ${engine_path} (precision=${precision})"

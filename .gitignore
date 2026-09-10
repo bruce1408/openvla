@@ -155,6 +155,9 @@ wandb/
 # Generated TensorRT deployment artifacts (large and machine-specific)
 deploy/tensorrt/artifacts/
 
+# Machine-local path overrides (shared NFS / Thor / laptop)
+env.local.sh
+
 
 *.json
 
@@ -167,3 +170,7 @@ hf_cache/
 !deploy/tensorrt/runtime/cpp/CMakeLists.txt
 !deploy/tensorrt/build/
 !deploy/tensorrt/build/build_vision_engine.sh
+
+
+artifacts/
+*.pid

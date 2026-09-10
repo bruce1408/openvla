@@ -42,11 +42,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the extra stock predict_action pass used to verify the golden decode.",
     )
+
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=REPO_ROOT / "deploy/tensorrt/artifacts/golden/sample_0001",
     )
+    
     return parser.parse_args()
 
 
